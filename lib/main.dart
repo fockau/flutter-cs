@@ -21,33 +21,6 @@ class App extends StatelessWidget {
 
 enum HttpMethod { get, post, put, delete }
 
-class Store {
-  static const _kBaseUrl = 'baseUrl';
-  static const _kAuthData = 'authData'; // ✅ 保存完整的 "Bearer xxx"
-  static const _kCookie = 'cookie'; // 可选：保存 server_name_session=...
-  static const _kLastSubscribeUrl = 'lastSubscribeUrl';
-
-  static Future<SharedPreferences> _sp() => SharedPreferences.getInstance();
-
-  static Future<void> saveBaseUrl(String v) async => (await _sp()).setString(_kBaseUrl, v);
-  static Future<void> saveAuthData(String v) async => (await _sp()).setString(_kAuthData, v);
-  static Future<void> saveCookie(String v) async => (await _sp()).setString(_kCookie, v);
-  static Future<void> saveLastSubscribeUrl(String v) async => (await _sp()).setString(_kLastSubscribeUrl, v);
-
-  static Future<String> getBaseUrl() async => (await _sp()).getString(_kBaseUrl) ?? '';
-  static Future<String> getAuthData() async => (await _sp()).getString(_kAuthData) ?? '';
-  static Future<String> getCookie() async => (await _sp()).getString(_kCookie) ?? '';
-  static Future<String> getLastSubscribeUrl() async => (await _sp()).getString(_kLastSubscribeUrl) ?? '';
-
-  static Future<void> clear() async {
-    final sp = await _sp();
-    await sp.remove(_kBaseUrl);
-    await sp.remove(_kAuthData);
-    await sp.remove(_kCookie);
-    await sp.remove(_kLastSubscribeUrl);
-  }
-}
-
 String _normBaseUrl(String s) {
   s = s.trim();
   while (s.endsWith('/')) s = s.substring(0, s.length - 1);
@@ -89,6 +62,168 @@ String _extractSessionCookie(String? setCookie) {
   return m?.group(1) ?? '';
 }
 
+/// ==================== 历史登录数据模型 ====================
+class LoginProfile {
+  final String id; // 用于唯一标识（简单用 baseUrl|email 的 hash）
+  final String baseUrl;
+  final String email;
+  final String authData; // "Bearer xxxx"
+  final String cookie; // server_name_session=...
+  final String lastSubscribeUrl;
+  final int savedAtMs; // 时间戳
+
+  const LoginProfile({
+    required this.id,
+    required this.baseUrl,
+    required this.email,
+    required this.authData,
+    required this.cookie,
+    required this.lastSubscribeUrl,
+    required this.savedAtMs,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'baseUrl': baseUrl,
+        'email': email,
+        'authData': authData,
+        'cookie': cookie,
+        'lastSubscribeUrl': lastSubscribeUrl,
+        'savedAtMs': savedAtMs,
+      };
+
+  static LoginProfile? fromJson(dynamic j) {
+    if (j is! Map) return null;
+    final id = (j['id'] ?? '').toString();
+    final baseUrl = (j['baseUrl'] ?? '').toString();
+    final email = (j['email'] ?? '').toString();
+    final authData = (j['authData'] ?? '').toString();
+    if (id.isEmpty || baseUrl.isEmpty || authData.isEmpty) return null;
+    return LoginProfile(
+      id: id,
+      baseUrl: baseUrl,
+      email: email,
+      authData: authData,
+      cookie: (j['cookie'] ?? '').toString(),
+      lastSubscribeUrl: (j['lastSubscribeUrl'] ?? '').toString(),
+      savedAtMs: int.tryParse((j['savedAtMs'] ?? '0').toString()) ?? 0,
+    );
+  }
+
+  LoginProfile copyWith({
+    String? cookie,
+    String? lastSubscribeUrl,
+    int? savedAtMs,
+    String? authData,
+  }) {
+    return LoginProfile(
+      id: id,
+      baseUrl: baseUrl,
+      email: email,
+      authData: authData ?? this.authData,
+      cookie: cookie ?? this.cookie,
+      lastSubscribeUrl: lastSubscribeUrl ?? this.lastSubscribeUrl,
+      savedAtMs: savedAtMs ?? this.savedAtMs,
+    );
+  }
+}
+
+String _makeProfileId(String baseUrl, String email) {
+  // 够用即可：避免重复（同站点同邮箱覆盖）
+  final s = '${baseUrl.toLowerCase()}|${email.toLowerCase()}';
+  return s.codeUnits.fold<int>(0, (a, b) => (a * 131 + b) & 0x7fffffff).toString();
+}
+
+/// ==================== 本地存储 ====================
+class Store {
+  static const _kCurrentBaseUrl = 'current_baseUrl';
+  static const _kCurrentAuthData = 'current_authData';
+  static const _kCurrentCookie = 'current_cookie';
+  static const _kCurrentLastSubscribeUrl = 'current_lastSubscribeUrl';
+  static const _kProfiles = 'profiles_json'; // List<LoginProfile>
+
+  static Future<SharedPreferences> _sp() => SharedPreferences.getInstance();
+
+  static Future<void> saveCurrent({
+    required String baseUrl,
+    required String authData,
+    required String cookie,
+    required String lastSubscribeUrl,
+  }) async {
+    final sp = await _sp();
+    await sp.setString(_kCurrentBaseUrl, baseUrl);
+    await sp.setString(_kCurrentAuthData, authData);
+    await sp.setString(_kCurrentCookie, cookie);
+    await sp.setString(_kCurrentLastSubscribeUrl, lastSubscribeUrl);
+  }
+
+  static Future<String> getCurrentBaseUrl() async => (await _sp()).getString(_kCurrentBaseUrl) ?? '';
+  static Future<String> getCurrentAuthData() async => (await _sp()).getString(_kCurrentAuthData) ?? '';
+  static Future<String> getCurrentCookie() async => (await _sp()).getString(_kCurrentCookie) ?? '';
+  static Future<String> getCurrentLastSubscribeUrl() async =>
+      (await _sp()).getString(_kCurrentLastSubscribeUrl) ?? '';
+
+  static Future<List<LoginProfile>> loadProfiles() async {
+    final sp = await _sp();
+    final s = sp.getString(_kProfiles);
+    if (s == null || s.isEmpty) return [];
+    try {
+      final j = jsonDecode(s);
+      if (j is List) {
+        final out = <LoginProfile>[];
+        for (final it in j) {
+          final p = LoginProfile.fromJson(it);
+          if (p != null) out.add(p);
+        }
+        // 新的在前
+        out.sort((a, b) => b.savedAtMs.compareTo(a.savedAtMs));
+        return out;
+      }
+    } catch (_) {}
+    return [];
+  }
+
+  static Future<void> saveProfiles(List<LoginProfile> profiles) async {
+    final sp = await _sp();
+    final list = profiles.map((e) => e.toJson()).toList();
+    await sp.setString(_kProfiles, jsonEncode(list));
+  }
+
+  /// 新增或覆盖（同 id 覆盖）
+  static Future<void> upsertProfile(LoginProfile p) async {
+    final profiles = await loadProfiles();
+    final idx = profiles.indexWhere((x) => x.id == p.id);
+    if (idx >= 0) {
+      profiles[idx] = p;
+    } else {
+      profiles.add(p);
+    }
+    profiles.sort((a, b) => b.savedAtMs.compareTo(a.savedAtMs));
+    await saveProfiles(profiles);
+  }
+
+  static Future<void> deleteProfile(String id) async {
+    final profiles = await loadProfiles();
+    profiles.removeWhere((x) => x.id == id);
+    await saveProfiles(profiles);
+  }
+
+  static Future<void> clearProfiles() async {
+    final sp = await _sp();
+    await sp.remove(_kProfiles);
+  }
+
+  static Future<void> clearAll() async {
+    final sp = await _sp();
+    await sp.remove(_kCurrentBaseUrl);
+    await sp.remove(_kCurrentAuthData);
+    await sp.remove(_kCurrentCookie);
+    await sp.remove(_kCurrentLastSubscribeUrl);
+    await sp.remove(_kProfiles);
+  }
+}
+
+/// ==================== UI 主页 ====================
 class Home extends StatefulWidget {
   const Home({super.key});
   @override
@@ -109,10 +244,13 @@ class _HomeState extends State<Home> {
   bool loading = false;
 
   String? authData; // "Bearer xxx"
+  String? cookie; // server_name_session=...
   String? lastSubscribeUrl;
 
   int? respStatus;
   String? respText;
+
+  List<LoginProfile> profiles = [];
 
   @override
   void initState() {
@@ -131,15 +269,19 @@ class _HomeState extends State<Home> {
   }
 
   Future<void> _loadLocal() async {
-    final base = await Store.getBaseUrl();
-    final a = await Store.getAuthData();
-    final sub = await Store.getLastSubscribeUrl();
+    final base = await Store.getCurrentBaseUrl();
+    final a = await Store.getCurrentAuthData();
+    final c = await Store.getCurrentCookie();
+    final sub = await Store.getCurrentLastSubscribeUrl();
+    final ps = await Store.loadProfiles();
 
     if (base.isNotEmpty) baseUrlCtrl.text = base;
 
     setState(() {
       authData = a.isEmpty ? null : a;
+      cookie = c.isEmpty ? null : c;
       lastSubscribeUrl = sub.isEmpty ? null : sub;
+      profiles = ps;
     });
 
     // 有 authData 就自动刷新一次订阅
@@ -148,23 +290,9 @@ class _HomeState extends State<Home> {
     }
   }
 
-  Map<String, String> _commonHeaders({bool json = true}) {
-    final h = <String, String>{
-      'Accept': 'application/json',
-    };
-    if (json) h['Content-Type'] = 'application/json';
-
-    // ✅ 必须：用 auth_data 原样作为 Authorization
-    final a = authData;
-    if (a != null && a.isNotEmpty) {
-      h['Authorization'] = a;
-    }
-
-    // 可选：带上会话 cookie（某些站点会检查）
-    // 这不会影响你现在的站点，即使不需要也没事
-    // 如果你不想带，可以删掉下面三行
-    // ignore: unused_local_variable
-    return h;
+  Future<void> _reloadProfiles() async {
+    final ps = await Store.loadProfiles();
+    setState(() => profiles = ps);
   }
 
   Future<void> loginAndPersist() async {
@@ -210,20 +338,36 @@ class _HomeState extends State<Home> {
         throw Exception('登录成功但未找到 data.auth_data（后端返回结构与预期不一致）');
       }
 
-      // 保存 baseUrl + authData
-      await Store.saveBaseUrl(base);
-      await Store.saveAuthData(a);
+      final c = _extractSessionCookie(resp.headers['set-cookie']);
 
-      // 保存 cookie（可选）
-      final cookie = _extractSessionCookie(resp.headers['set-cookie']);
-      if (cookie.isNotEmpty) await Store.saveCookie(cookie);
+      // 先写当前
+      await Store.saveCurrent(
+        baseUrl: base,
+        authData: a,
+        cookie: c,
+        lastSubscribeUrl: (lastSubscribeUrl ?? ''),
+      );
+
+      // 写历史（覆盖同站点同邮箱）
+      final profile = LoginProfile(
+        id: _makeProfileId(base, email),
+        baseUrl: base,
+        email: email,
+        authData: a,
+        cookie: c,
+        lastSubscribeUrl: (lastSubscribeUrl ?? ''),
+        savedAtMs: DateTime.now().millisecondsSinceEpoch,
+      );
+      await Store.upsertProfile(profile);
 
       setState(() {
         authData = a;
+        cookie = c.isEmpty ? null : c;
       });
+      await _reloadProfiles();
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('登录成功，已保存 auth_data')));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('登录成功，已保存到历史')));
 
       // 登录后拉一次订阅并保存
       await fetchSubscribe(showToast: true);
@@ -244,18 +388,17 @@ class _HomeState extends State<Home> {
 
     try {
       final base = _normBaseUrl(baseUrlCtrl.text);
-      final a = authData ?? await Store.getAuthData();
+      final a = authData ?? await Store.getCurrentAuthData();
       if (a.isEmpty) throw Exception('未登录：请先登录');
 
-      // headers：Authorization=auth_data
       final headers = <String, String>{
         'Accept': 'application/json',
-        'Authorization': a,
+        'Authorization': a, // ✅ auth_data 原样
       };
 
-      // 可选：带 cookie
-      final cookie = await Store.getCookie();
-      if (cookie.isNotEmpty) headers['Cookie'] = cookie;
+      // 可选带 cookie
+      final c = cookie ?? await Store.getCurrentCookie();
+      if (c.isNotEmpty) headers['Cookie'] = c;
 
       final uri = Uri.parse('$base/api/v1/user/getSubscribe');
       final resp = await http.get(uri, headers: headers).timeout(const Duration(seconds: 15));
@@ -273,8 +416,34 @@ class _HomeState extends State<Home> {
       final sub = _extractSubscribeUrl(j);
       if (sub.isEmpty) throw Exception('返回里未找到 data.subscribe_url');
 
-      await Store.saveLastSubscribeUrl(sub);
-      setState(() => lastSubscribeUrl = sub);
+      // 更新 cookie（有些接口也会刷新）
+      final newCookie = _extractSessionCookie(resp.headers['set-cookie']);
+      final finalCookie = newCookie.isNotEmpty ? newCookie : (c.isNotEmpty ? c : '');
+
+      // 保存当前
+      await Store.saveCurrent(baseUrl: base, authData: a, cookie: finalCookie, lastSubscribeUrl: sub);
+
+      setState(() {
+        lastSubscribeUrl = sub;
+        cookie = finalCookie.isEmpty ? null : finalCookie;
+      });
+
+      // 同步更新历史里“当前站点+邮箱”的订阅链接/时间（如果找得到同 baseUrl/email）
+      final email = emailCtrl.text.trim();
+      final pid = _makeProfileId(base, email.isEmpty ? 'unknown' : email);
+      final ps = await Store.loadProfiles();
+      final idx = ps.indexWhere((x) => x.id == pid);
+      if (idx >= 0) {
+        final updated = ps[idx].copyWith(
+          lastSubscribeUrl: sub,
+          cookie: finalCookie,
+          savedAtMs: DateTime.now().millisecondsSinceEpoch,
+          authData: a,
+        );
+        ps[idx] = updated;
+        await Store.saveProfiles(ps);
+        await _reloadProfiles();
+      }
 
       if (showToast && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已获取最新订阅链接')));
@@ -290,7 +459,7 @@ class _HomeState extends State<Home> {
   Future<void> callApi() async {
     final base = _normBaseUrl(baseUrlCtrl.text);
     final path = pathCtrl.text.trim();
-    final a = authData ?? await Store.getAuthData();
+    final a = authData ?? await Store.getCurrentAuthData();
     if (a.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先登录获取 auth_data')));
       return;
@@ -310,11 +479,11 @@ class _HomeState extends State<Home> {
       final uri = Uri.parse('$base$path');
       final headers = <String, String>{
         'Accept': 'application/json',
-        'Authorization': a, // ✅ auth_data 原样
+        'Authorization': a,
         'Content-Type': 'application/json',
       };
-      final cookie = await Store.getCookie();
-      if (cookie.isNotEmpty) headers['Cookie'] = cookie;
+      final c = cookie ?? await Store.getCurrentCookie();
+      if (c.isNotEmpty) headers['Cookie'] = c;
 
       http.Response resp;
       switch (method) {
@@ -355,16 +524,64 @@ class _HomeState extends State<Home> {
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制订阅链接')));
   }
 
-  Future<void> clearLocal() async {
-    await Store.clear();
+  Future<void> clearAllLocal() async {
+    await Store.clearAll();
     setState(() {
       authData = null;
+      cookie = null;
       lastSubscribeUrl = null;
       respStatus = null;
       respText = null;
+      profiles = [];
     });
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已清空本地保存')));
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已清空所有本地数据与历史')));
+  }
+
+  /// 选择某个历史账号
+  Future<void> useProfile(LoginProfile p) async {
+    baseUrlCtrl.text = p.baseUrl;
+    emailCtrl.text = p.email;
+    // 密码不保存（安全），留空
+    pwdCtrl.text = '';
+
+    setState(() {
+      authData = p.authData;
+      cookie = p.cookie.isEmpty ? null : p.cookie;
+      lastSubscribeUrl = p.lastSubscribeUrl.isEmpty ? null : p.lastSubscribeUrl;
+    });
+
+    await Store.saveCurrent(
+      baseUrl: p.baseUrl,
+      authData: p.authData,
+      cookie: p.cookie,
+      lastSubscribeUrl: p.lastSubscribeUrl,
+    );
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已切换到该历史账号，正在刷新订阅…')));
+    await fetchSubscribe(showToast: false);
+  }
+
+  Future<void> deleteProfile(LoginProfile p) async {
+    await Store.deleteProfile(p.id);
+    await _reloadProfiles();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已删除该历史记录')));
+  }
+
+  Future<void> clearProfilesOnly() async {
+    await Store.clearProfiles();
+    await _reloadProfiles();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已清空历史记录')));
+  }
+
+  String _fmtTime(int ms) {
+    if (ms <= 0) return '-';
+    final dt = DateTime.fromMillisecondsSinceEpoch(ms);
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${dt.year}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}';
   }
 
   @override
@@ -380,10 +597,16 @@ class _HomeState extends State<Home> {
             onPressed: loading ? null : () => fetchSubscribe(showToast: true),
             icon: const Icon(Icons.refresh),
           ),
-          IconButton(
-            tooltip: '清空本地',
-            onPressed: loading ? null : clearLocal,
-            icon: const Icon(Icons.delete_outline),
+          PopupMenuButton<String>(
+            tooltip: '更多',
+            onSelected: (v) async {
+              if (v == 'clear_profiles') await clearProfilesOnly();
+              if (v == 'clear_all') await clearAllLocal();
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'clear_profiles', child: Text('清空历史记录')),
+              PopupMenuItem(value: 'clear_all', child: Text('清空全部数据（含当前登录）')),
+            ],
           ),
         ],
       ),
@@ -391,6 +614,42 @@ class _HomeState extends State<Home> {
         padding: const EdgeInsets.all(16),
         child: ListView(
           children: [
+            // ===== 历史登录列表 =====
+            Row(
+              children: [
+                const Expanded(
+                  child: Text('历史登录', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+                ),
+                TextButton(
+                  onPressed: loading || profiles.isEmpty ? null : clearProfilesOnly,
+                  child: const Text('清空历史'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (profiles.isEmpty)
+              const Text('暂无历史记录（登录一次就会自动保存）', style: TextStyle(color: Colors.black54))
+            else
+              ...profiles.map((p) {
+                return Card(
+                  child: ListTile(
+                    title: Text('${p.email.isEmpty ? '(未记录邮箱)' : p.email}  ·  ${p.baseUrl}'),
+                    subtitle: Text('保存时间：${_fmtTime(p.savedAtMs)}'
+                        '${p.lastSubscribeUrl.isNotEmpty ? '\n订阅：${p.lastSubscribeUrl}' : ''}'),
+                    isThreeLine: p.lastSubscribeUrl.isNotEmpty,
+                    onTap: loading ? null : () => useProfile(p),
+                    trailing: IconButton(
+                      tooltip: '删除',
+                      onPressed: loading ? null : () => deleteProfile(p),
+                      icon: const Icon(Icons.delete_outline),
+                    ),
+                  ),
+                );
+              }),
+
+            const Divider(height: 28),
+
+            // ===== 登录区 =====
             const Text('登录', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
             TextField(
@@ -400,13 +659,13 @@ class _HomeState extends State<Home> {
             const SizedBox(height: 8),
             TextField(
               controller: emailCtrl,
-              decoration: const InputDecoration(labelText: '邮箱'),
+              decoration: const InputDecoration(labelText: '邮箱（用于历史记录标识）'),
               keyboardType: TextInputType.emailAddress,
             ),
             const SizedBox(height: 8),
             TextField(
               controller: pwdCtrl,
-              decoration: const InputDecoration(labelText: '密码'),
+              decoration: const InputDecoration(labelText: '密码（不会保存）'),
               obscureText: true,
             ),
             const SizedBox(height: 10),
@@ -414,20 +673,21 @@ class _HomeState extends State<Home> {
               width: double.infinity,
               child: ElevatedButton(
                 onPressed: loading ? null : loginAndPersist,
-                child: Text(loading ? '处理中...' : '登录并保存到本地（使用 auth_data）'),
+                child: Text(loading ? '处理中...' : '登录并保存到历史（使用 auth_data）'),
               ),
             ),
             const SizedBox(height: 8),
             Text(
-              loggedIn ? '✅ 已保存 auth_data（重启 App 仍然有效）' : '未登录',
+              loggedIn ? '✅ 当前已登录（auth_data 已保存）' : '未登录',
               style: TextStyle(color: loggedIn ? Colors.green : Colors.black54),
             ),
 
             const Divider(height: 28),
 
+            // ===== 订阅链接 =====
             const Text('订阅链接', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
-            if (lastSubscribeUrl != null) ...[
+            if (lastSubscribeUrl != null && lastSubscribeUrl!.isNotEmpty) ...[
               SelectableText(lastSubscribeUrl!),
               const SizedBox(height: 10),
               SizedBox(
@@ -438,11 +698,12 @@ class _HomeState extends State<Home> {
                 ),
               ),
             ] else ...[
-              const Text('暂无（登录后点右上角刷新或直接请求 getSubscribe）'),
+              const Text('暂无（登录后点右上角刷新或请求 getSubscribe）'),
             ],
 
             const Divider(height: 28),
 
+            // ===== 自定义 API 请求 =====
             const Text('自定义 API 请求', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
             Row(
