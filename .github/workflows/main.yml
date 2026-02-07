@@ -1,4 +1,4 @@
-name: Android Build (Flutter APK)
+name: Android Build (Clean Flutter Template)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-apk:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,49 +26,36 @@ jobs:
           channel: "stable"
           cache: true
 
-      - name: Find Flutter project root
-        id: find_flutter
-        shell: bash
+      - name: Show repo files
         run: |
-          set -euo pipefail
-          echo "Repo tree (top 3 levels):"
-          find . -maxdepth 3 -type f -name pubspec.yaml -print
-          PUBSPEC_PATH="$(find . -maxdepth 6 -type f -name pubspec.yaml | head -n 1)"
-          if [ -z "${PUBSPEC_PATH}" ]; then
-            echo "ERROR: pubspec.yaml not found in repo (maxdepth 6)."
-            exit 1
-          fi
-          PROJECT_DIR="$(dirname "${PUBSPEC_PATH}")"
-          echo "Found pubspec.yaml at: ${PUBSPEC_PATH}"
-          echo "Project dir: ${PROJECT_DIR}"
-          echo "project_dir=${PROJECT_DIR}" >> "$GITHUB_OUTPUT"
+          echo "== repo root =="
+          ls -la
+          echo "== lib =="
+          ls -la lib || true
+          echo "== pubspec =="
+          test -f pubspec.yaml && cat pubspec.yaml || (echo "pubspec.yaml missing" && exit 1)
 
-      - name: Flutter doctor
-        run: flutter doctor -v
+      # ✅ 关键：在 CI 里生成一个干净的 Flutter app 模板
+      - name: Create clean flutter app
+        run: |
+          flutter create -t app clean_app --org com.example --project-name xboard_onefile
+          rm -rf clean_app/lib
+          rm -f clean_app/pubspec.yaml
+          cp -r lib clean_app/lib
+          cp pubspec.yaml clean_app/pubspec.yaml
 
       - name: Pub get
-        working-directory: ${{ steps.find_flutter.outputs.project_dir }}
+        working-directory: clean_app
         run: flutter pub get
 
       - name: Build release APK
-        working-directory: ${{ steps.find_flutter.outputs.project_dir }}
+        working-directory: clean_app
         run: flutter build apk --release
 
       - name: Collect APK
-        shell: bash
         run: |
-          set -euo pipefail
-          PROJECT_DIR="${{ steps.find_flutter.outputs.project_dir }}"
-          APK_PATH="${PROJECT_DIR}/build/app/outputs/flutter-apk/app-release.apk"
-          if [ ! -f "${APK_PATH}" ]; then
-            echo "ERROR: APK not found at ${APK_PATH}"
-            echo "Listing build outputs:"
-            ls -R "${PROJECT_DIR}/build" || true
-            exit 1
-          fi
           mkdir -p dist
-          cp "${APK_PATH}" dist/app-release.apk
-          echo "APK collected -> dist/app-release.apk"
+          cp clean_app/build/app/outputs/flutter-apk/app-release.apk dist/app-release.apk
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
