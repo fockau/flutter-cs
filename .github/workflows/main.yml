@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-apk:
+  build:
     runs-on: ubuntu-latest
 
     steps:
@@ -18,8 +18,6 @@ jobs:
         with:
           distribution: "temurin"
           java-version: "17"
-          # ⚠️ 不要启用 gradle cache，否则你这种情况会直接报错
-          # cache: "gradle"
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -28,19 +26,49 @@ jobs:
           channel: "stable"
           cache: true
 
+      - name: Find Flutter project root
+        id: find_flutter
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Repo tree (top 3 levels):"
+          find . -maxdepth 3 -type f -name pubspec.yaml -print
+          PUBSPEC_PATH="$(find . -maxdepth 6 -type f -name pubspec.yaml | head -n 1)"
+          if [ -z "${PUBSPEC_PATH}" ]; then
+            echo "ERROR: pubspec.yaml not found in repo (maxdepth 6)."
+            exit 1
+          fi
+          PROJECT_DIR="$(dirname "${PUBSPEC_PATH}")"
+          echo "Found pubspec.yaml at: ${PUBSPEC_PATH}"
+          echo "Project dir: ${PROJECT_DIR}"
+          echo "project_dir=${PROJECT_DIR}" >> "$GITHUB_OUTPUT"
+
       - name: Flutter doctor
         run: flutter doctor -v
 
       - name: Pub get
+        working-directory: ${{ steps.find_flutter.outputs.project_dir }}
         run: flutter pub get
 
       - name: Build release APK
+        working-directory: ${{ steps.find_flutter.outputs.project_dir }}
         run: flutter build apk --release
 
       - name: Collect APK
+        shell: bash
         run: |
+          set -euo pipefail
+          PROJECT_DIR="${{ steps.find_flutter.outputs.project_dir }}"
+          APK_PATH="${PROJECT_DIR}/build/app/outputs/flutter-apk/app-release.apk"
+          if [ ! -f "${APK_PATH}" ]; then
+            echo "ERROR: APK not found at ${APK_PATH}"
+            echo "Listing build outputs:"
+            ls -R "${PROJECT_DIR}/build" || true
+            exit 1
+          fi
           mkdir -p dist
-          cp build/app/outputs/flutter-apk/app-release.apk dist/app-release.apk
+          cp "${APK_PATH}" dist/app-release.apk
+          echo "APK collected -> dist/app-release.apk"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
