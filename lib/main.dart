@@ -1,406 +1,196 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 
+import 'auth_page.dart';
 import 'config_manager.dart';
-import 'auth_dialog.dart';
+import 'local_store.dart';
 
-void main() => runApp(const App());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await LocalStore.I.init();
+  runApp(const XBoardClientApp());
+}
 
-class App extends StatelessWidget {
-  const App({super.key});
+class XBoardClientApp extends StatelessWidget {
+  const XBoardClientApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      title: 'King',
+      theme: ThemeData(
+        useMaterial3: true,
+        colorSchemeSeed: const Color(0xFF7A5CFF),
+        brightness: Brightness.dark,
+      ),
+      // 默认直接进认证页
+      home: const AuthGate(),
       debugShowCheckedModeBanner: false,
-      title: 'XBoard Client',
-      theme: ThemeData(useMaterial3: true),
-      home: const Home(),
     );
   }
 }
 
-Uri _apiV1(String pathUnderApiV1) {
-  final base = ConfigManager.I.apiBaseUrl;
-  final prefix = ConfigManager.I.apiPrefix;
-  var p = pathUnderApiV1;
-  if (!p.startsWith('/')) p = '/$p';
-  return Uri.parse('$base$prefix$p');
-}
+/// 启动路由：永远先去认证页
+/// - 如果本地有 token，也可以选择自动尝试拉订阅后再进 Home（这里我给你做成：先认证页，避免你说的延迟感/跳动）
+/// - 你想“有 token 就直接进 Home”的话我也可以给你改
+class AuthGate extends StatefulWidget {
+  const AuthGate({super.key});
 
-String _prettyJsonIfPossible(String body) {
-  try {
-    final j = jsonDecode(body);
-    const encoder = JsonEncoder.withIndent('  ');
-    return encoder.convert(j);
-  } catch (_) {
-    return body;
-  }
-}
-
-String _extractSubscribeUrl(dynamic j) {
-  if (j is Map) {
-    final data = j['data'];
-    if (data is Map && data['subscribe_url'] != null) return '${data['subscribe_url']}';
-  }
-  return '';
-}
-
-String _extractAuthData(Map<String, dynamic> j) {
-  final data = j['data'];
-  if (data is Map && data['auth_data'] != null) return '${data['auth_data']}';
-  if (data is Map && data['token'] != null) return 'Bearer ${data['token']}';
-  return '';
-}
-
-String _extractSessionCookie(String? setCookie) {
-  if (setCookie == null || setCookie.isEmpty) return '';
-  final m = RegExp(r'(server_name_session=[^;]+)').firstMatch(setCookie);
-  return m?.group(1) ?? '';
-}
-
-class Store {
-  static const _kEmail = 'email';
-  static const _kPassword = 'password';
-  static const _kAuthData = 'auth_data';
-  static const _kCookie = 'cookie';
-  static const _kSubscribeUrl = 'subscribe_url';
-
-  static Future<SharedPreferences> _sp() => SharedPreferences.getInstance();
-
-  static Future<void> saveAll({
-    required String email,
-    required String password,
-    required String authData,
-    required String cookie,
-    required String subscribeUrl,
-  }) async {
-    final sp = await _sp();
-    await sp.setString(_kEmail, email);
-    await sp.setString(_kPassword, password);
-    await sp.setString(_kAuthData, authData);
-    await sp.setString(_kCookie, cookie);
-    await sp.setString(_kSubscribeUrl, subscribeUrl);
-  }
-
-  static Future<String> email() async => (await _sp()).getString(_kEmail) ?? '';
-  static Future<String> password() async => (await _sp()).getString(_kPassword) ?? '';
-  static Future<String> authData() async => (await _sp()).getString(_kAuthData) ?? '';
-  static Future<String> cookie() async => (await _sp()).getString(_kCookie) ?? '';
-  static Future<String> subscribeUrl() async => (await _sp()).getString(_kSubscribeUrl) ?? '';
-
-  static Future<void> clear() async {
-    final sp = await _sp();
-    await sp.remove(_kEmail);
-    await sp.remove(_kPassword);
-    await sp.remove(_kAuthData);
-    await sp.remove(_kCookie);
-    await sp.remove(_kSubscribeUrl);
-  }
-}
-
-class Home extends StatefulWidget {
-  const Home({super.key});
   @override
-  State<Home> createState() => _HomeState();
+  State<AuthGate> createState() => _AuthGateState();
 }
 
-class _HomeState extends State<Home> {
-  String email = '';
-  String password = '';
-  String authData = '';
-  String cookie = '';
-  String subscribeUrl = '';
-
-  bool loading = false;
-  int? respStatus;
-  String? respText;
-  int lastFetchedAtMs = 0;
-
+class _AuthGateState extends State<AuthGate> {
   @override
   void initState() {
     super.initState();
-    _boot();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _goAuthFirst());
   }
 
-  String _fmtTime(int ms) {
-    if (ms <= 0) return '-';
-    final dt = DateTime.fromMillisecondsSinceEpoch(ms);
-    String two(int v) => v.toString().padLeft(2, '0');
-    return '${dt.year}-${two(dt.month)}-${two(dt.day)} ${two(dt.hour)}:${two(dt.minute)}:${two(dt.second)}';
-  }
+  Future<void> _goAuthFirst() async {
+    final s = LocalStore.I;
 
-  Map<String, String> _headers() {
-    final h = <String, String>{'Accept': 'application/json'};
-    if (authData.isNotEmpty) h['Authorization'] = authData;
-    if (cookie.isNotEmpty) h['Cookie'] = cookie;
-    return h;
-  }
-
-  Future<Map<String, dynamic>> _parseJson(http.Response resp) async {
-    try {
-      final decoded = jsonDecode(resp.body);
-      if (decoded is Map<String, dynamic>) return decoded;
-      throw Exception('Unexpected JSON type');
-    } catch (_) {
-      throw Exception('后端返回不是 JSON：HTTP ${resp.statusCode}\n${resp.body}');
-    }
-  }
-
-  String _formatApiError(Map<String, dynamic> j, int statusCode) {
-    final msg = j['message']?.toString() ?? 'HTTP $statusCode';
-    final errs = j['errors'];
-    if (errs == null) return msg;
-    return '$msg\n$errs';
-  }
-
-  Future<void> _boot() async {
-    await ConfigManager.I.init(); // ✅ 初始化远程配置 + 域名竞速
-
-    email = await Store.email();
-    password = await Store.password();
-    authData = await Store.authData();
-    cookie = await Store.cookie();
-    subscribeUrl = await Store.subscribeUrl();
-    setState(() {});
-
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      // 先尝试自动登录
-      if (email.isNotEmpty && password.isNotEmpty) {
-        await _autoLoginAndFetch();
-      }
-      // 未登录：强制弹窗
-      if (authData.isEmpty) {
-        await _openAuthDialog(forceLogin: true);
-      }
-    });
-  }
-
-  Future<void> _autoLoginAndFetch() async {
-    try {
-      await _loginWithSavedCreds();
-      await fetchSubscribe(showToast: false);
-    } catch (_) {
-      // ignore
-    }
-  }
-
-  Future<void> _loginWithSavedCreds() async {
-    // 每次自动登录前也可以刷新一次竞速（可选）
-    await ConfigManager.I.refreshRemoteConfigAndRace();
-
-    final resp = await http
-        .post(
-          _apiV1('/passport/auth/login'),
-          headers: const {'Accept': 'application/json', 'Content-Type': 'application/json'},
-          body: jsonEncode({'email': email, 'password': password}),
-        )
-        .timeout(const Duration(seconds: 20));
-
-    respStatus = resp.statusCode;
-    respText = _prettyJsonIfPossible(resp.body);
-    setState(() {});
-
-    final j = await _parseJson(resp);
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      throw Exception(_formatApiError(j, resp.statusCode));
-    }
-
-    final a = _extractAuthData(j);
-    if (a.isEmpty) throw Exception('自动登录缺少 data.auth_data');
-    authData = a;
-
-    final c = _extractSessionCookie(resp.headers['set-cookie']);
-    if (c.isNotEmpty) cookie = c;
-
-    await Store.saveAll(
-      email: email,
-      password: password,
-      authData: authData,
-      cookie: cookie,
-      subscribeUrl: subscribeUrl,
-    );
-    setState(() {});
-  }
-
-  Future<void> _openAuthDialog({required bool forceLogin}) async {
-    final res = await XBoardAuthDialog.show(
-      context,
-      initialEmail: email,
-      initialPassword: password,
-      forceLogin: forceLogin,
+    final res = await Navigator.of(context).pushReplacement<AuthResult?>(
+      AuthPage.route(
+        force: true, // 启动必须登录：不可返回
+        initialEmail: s.email,
+        initialPassword: s.password,
+      ),
     );
 
     if (res == null) return;
 
-    email = res.email;
-    password = res.password;
-    authData = res.authData;
-    cookie = res.cookie;
+    await s.saveAuth(email: res.email, password: res.password, authData: res.authData, cookie: res.cookie);
 
-    await Store.saveAll(
-      email: email,
-      password: password,
-      authData: authData,
-      cookie: cookie,
-      subscribeUrl: subscribeUrl,
-    );
-
-    setState(() {});
-    await fetchSubscribe(showToast: true);
-  }
-
-  Future<void> fetchSubscribe({required bool showToast}) async {
-    if (authData.isEmpty) return;
-
-    setState(() {
-      loading = true;
-      respStatus = null;
-      respText = null;
-    });
-
-    try {
-      final resp = await http
-          .get(_apiV1('/user/getSubscribe'), headers: _headers())
-          .timeout(const Duration(seconds: 15));
-
-      respStatus = resp.statusCode;
-      respText = _prettyJsonIfPossible(resp.body);
-      setState(() {});
-
-      final j = await _parseJson(resp);
-      if (resp.statusCode < 200 || resp.statusCode >= 300) {
-        throw Exception(_formatApiError(j, resp.statusCode));
-      }
-
-      final sub = _extractSubscribeUrl(j);
-      if (sub.isNotEmpty) subscribeUrl = sub;
-
-      final c = _extractSessionCookie(resp.headers['set-cookie']);
-      if (c.isNotEmpty) cookie = c;
-
-      lastFetchedAtMs = DateTime.now().millisecondsSinceEpoch;
-
-      await Store.saveAll(
-        email: email,
-        password: password,
-        authData: authData,
-        cookie: cookie,
-        subscribeUrl: subscribeUrl,
-      );
-
-      if (showToast && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已获取最新订阅')));
-      }
-      setState(() {});
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('错误：$e')));
-      }
-    } finally {
-      setState(() => loading = false);
-    }
-  }
-
-  Future<void> copySubscribe() async {
-    if (subscribeUrl.isEmpty) return;
-    await Clipboard.setData(ClipboardData(text: subscribeUrl));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制订阅链接')));
-  }
-
-  Future<void> clearAll() async {
-    await Store.clear();
-    email = '';
-    password = '';
-    authData = '';
-    cookie = '';
-    subscribeUrl = '';
-    respStatus = null;
-    respText = null;
-    lastFetchedAtMs = 0;
-    setState(() {});
-
-    if (mounted) {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _openAuthDialog(forceLogin: true));
-    }
+    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const HomePage()));
   }
 
   @override
   Widget build(BuildContext context) {
-    final loggedIn = authData.isNotEmpty;
+    // 这个页面不会被看到（只是过渡），给个纯黑占位
+    return const Scaffold(backgroundColor: Colors.black);
+  }
+}
+
+class HomePage extends StatefulWidget {
+  const HomePage({super.key});
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage> {
+  bool busy = false;
+  String? lastError;
+  Map<String, dynamic>? subscribeData;
+
+  String get _authData => LocalStore.I.authData;
+  String get _cookie => LocalStore.I.cookie;
+
+  Map<String, String> _authHeaders() {
+    final h = <String, String>{'Accept': 'application/json'};
+    if (_authData.isNotEmpty) h['Authorization'] = _authData;
+    if (_cookie.isNotEmpty) h['Cookie'] = _cookie;
+    return h;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _fetchSubscribe());
+  }
+
+  Future<void> _fetchSubscribe() async {
+    setState(() {
+      busy = true;
+      lastError = null;
+    });
+
+    try {
+      await ConfigManager.I.refreshRemoteConfigAndRace();
+      final uri = ConfigManager.I.api('/user/getSubscribe');
+
+      final resp = await http.get(uri, headers: _authHeaders()).timeout(const Duration(seconds: 20));
+      final j = jsonDecode(resp.body);
+
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw Exception('HTTP ${resp.statusCode}: ${j is Map ? (j['message'] ?? resp.body) : resp.body}');
+      }
+
+      if (j is! Map) throw Exception('返回不是对象');
+      final data = j['data'];
+      if (data is! Map) throw Exception('data 不是对象');
+
+      setState(() => subscribeData = Map<String, dynamic>.from(data));
+    } catch (e) {
+      setState(() => lastError = '获取订阅失败：$e');
+
+      final es = e.toString();
+      if (es.contains('403') || es.contains('未登录') || es.contains('登陆已过期')) {
+        await LocalStore.I.clearAuth();
+        if (!mounted) return;
+        Navigator.of(context).pushReplacement(AuthPage.route(force: true));
+      }
+    } finally {
+      setState(() => busy = false);
+    }
+  }
+
+  Future<void> _logout() async {
+    await LocalStore.I.clearAuth();
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(AuthPage.route(force: true));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final subUrl = (subscribeData?['subscribe_url'] ?? '').toString();
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('XBoard Client'),
+        title: const Text('订阅信息'),
         actions: [
-          IconButton(
-            tooltip: '认证',
-            onPressed: loading ? null : () => _openAuthDialog(forceLogin: false),
-            icon: const Icon(Icons.person),
-          ),
-          IconButton(
-            tooltip: '刷新订阅',
-            onPressed: (!loggedIn || loading) ? null : () => fetchSubscribe(showToast: true),
-            icon: const Icon(Icons.refresh),
-          ),
-          PopupMenuButton<String>(
-            onSelected: (v) async {
-              if (v == 'clear') await clearAll();
-            },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'clear', child: Text('清空本地数据')),
-            ],
-          ),
+          IconButton(onPressed: busy ? null : _fetchSubscribe, icon: const Icon(Icons.refresh)),
+          IconButton(onPressed: busy ? null : _logout, icon: const Icon(Icons.logout)),
         ],
       ),
       body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: ListView(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Card(
-              child: ListTile(
-                title: Text(loggedIn ? '已登录：$email' : '未登录'),
-                subtitle: Text('最后刷新：${_fmtTime(lastFetchedAtMs)}'),
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('订阅链接', style: TextStyle(fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 10),
+                    SelectableText(subUrl.isEmpty ? '暂无（请刷新）' : subUrl),
+                    if (busy) const Padding(padding: EdgeInsets.only(top: 10), child: LinearProgressIndicator(minHeight: 3)),
+                  ],
+                ),
               ),
             ),
             const SizedBox(height: 12),
-
-            const Text('订阅链接', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-            const SizedBox(height: 8),
-            if (subscribeUrl.isNotEmpty) ...[
-              SelectableText(subscribeUrl),
-              const SizedBox(height: 8),
-              Row(
-                children: [
-                  Expanded(child: OutlinedButton(onPressed: copySubscribe, child: const Text('复制订阅链接'))),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: ElevatedButton(
-                      onPressed: (!loggedIn || loading) ? null : () => fetchSubscribe(showToast: true),
-                      child: Text(loading ? '刷新中…' : '刷新订阅'),
+            Expanded(
+              child: Card(
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      const JsonEncoder.withIndent('  ').convert(subscribeData ?? {}),
+                      style: const TextStyle(fontFamily: 'monospace'),
                     ),
                   ),
-                ],
-              ),
-            ] else ...[
-              const Text('暂无（登录后会自动获取 /user/getSubscribe）'),
-            ],
-
-            const SizedBox(height: 18),
-            if (respStatus != null) Text('HTTP Status: $respStatus', style: const TextStyle(fontWeight: FontWeight.w700)),
-            if (respText != null) ...[
-              const SizedBox(height: 8),
-              Container(
-                padding: const EdgeInsets.all(12),
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.black12),
-                  borderRadius: BorderRadius.circular(12),
                 ),
-                child: SelectableText(respText!),
               ),
+            ),
+            if (lastError != null) ...[
+              const SizedBox(height: 12),
+              Text(lastError!, style: const TextStyle(color: Colors.red)),
             ],
           ],
         ),
