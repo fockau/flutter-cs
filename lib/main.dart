@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -18,110 +19,39 @@ class App extends StatelessWidget {
   }
 }
 
-/// ====== 本地持久化配置模型 ======
-enum AuthMode { bearer, plain }
-
-class PersistedConfig {
-  final String baseUrl;
-  final String token;
-  final AuthMode authMode;
-  final String fixedHeaderName;
-  final String fixedHeaderValue;
-
-  const PersistedConfig({
-    required this.baseUrl,
-    required this.token,
-    required this.authMode,
-    required this.fixedHeaderName,
-    required this.fixedHeaderValue,
-  });
-
-  Map<String, dynamic> toJson() => {
-        'baseUrl': baseUrl,
-        'token': token,
-        'authMode': authMode.name,
-        'fixedHeaderName': fixedHeaderName,
-        'fixedHeaderValue': fixedHeaderValue,
-      };
-
-  static PersistedConfig? fromJson(Map<String, dynamic>? j) {
-    if (j == null) return null;
-    final base = (j['baseUrl'] ?? '').toString();
-    final token = (j['token'] ?? '').toString();
-    if (base.isEmpty || token.isEmpty) return null;
-
-    final modeStr = (j['authMode'] ?? 'bearer').toString();
-    final mode = (modeStr == 'plain') ? AuthMode.plain : AuthMode.bearer;
-
-    return PersistedConfig(
-      baseUrl: base,
-      token: token,
-      authMode: mode,
-      fixedHeaderName: (j['fixedHeaderName'] ?? '').toString(),
-      fixedHeaderValue: (j['fixedHeaderValue'] ?? '').toString(),
-    );
-  }
-}
+enum HttpMethod { get, post, put, delete }
 
 class Store {
-  static const _k = 'xboard_config';
+  static const _kBaseUrl = 'baseUrl';
+  static const _kAuthData = 'authData'; // ✅ 保存完整的 "Bearer xxx"
+  static const _kCookie = 'cookie'; // 可选：保存 server_name_session=...
+  static const _kLastSubscribeUrl = 'lastSubscribeUrl';
 
-  static Future<PersistedConfig?> load() async {
-    final sp = await SharedPreferences.getInstance();
-    final s = sp.getString(_k);
-    if (s == null || s.isEmpty) return null;
-    try {
-      final j = jsonDecode(s);
-      if (j is Map<String, dynamic>) return PersistedConfig.fromJson(j);
-    } catch (_) {}
-    return null;
-  }
+  static Future<SharedPreferences> _sp() => SharedPreferences.getInstance();
 
-  static Future<void> save(PersistedConfig cfg) async {
-    final sp = await SharedPreferences.getInstance();
-    await sp.setString(_k, jsonEncode(cfg.toJson()));
-  }
+  static Future<void> saveBaseUrl(String v) async => (await _sp()).setString(_kBaseUrl, v);
+  static Future<void> saveAuthData(String v) async => (await _sp()).setString(_kAuthData, v);
+  static Future<void> saveCookie(String v) async => (await _sp()).setString(_kCookie, v);
+  static Future<void> saveLastSubscribeUrl(String v) async => (await _sp()).setString(_kLastSubscribeUrl, v);
+
+  static Future<String> getBaseUrl() async => (await _sp()).getString(_kBaseUrl) ?? '';
+  static Future<String> getAuthData() async => (await _sp()).getString(_kAuthData) ?? '';
+  static Future<String> getCookie() async => (await _sp()).getString(_kCookie) ?? '';
+  static Future<String> getLastSubscribeUrl() async => (await _sp()).getString(_kLastSubscribeUrl) ?? '';
 
   static Future<void> clear() async {
-    final sp = await SharedPreferences.getInstance();
-    await sp.remove(_k);
+    final sp = await _sp();
+    await sp.remove(_kBaseUrl);
+    await sp.remove(_kAuthData);
+    await sp.remove(_kCookie);
+    await sp.remove(_kLastSubscribeUrl);
   }
 }
-
-/// ====== 通用 HTTP 请求 ======
-enum HttpMethod { get, post, put, delete }
 
 String _normBaseUrl(String s) {
   s = s.trim();
   while (s.endsWith('/')) s = s.substring(0, s.length - 1);
   return s;
-}
-
-Map<String, String> _headersFromCfg(PersistedConfig cfg) {
-  final h = <String, String>{
-    'Accept': 'application/json',
-    'Content-Type': 'application/json',
-  };
-
-  if (cfg.fixedHeaderName.isNotEmpty && cfg.fixedHeaderValue.isNotEmpty) {
-    h[cfg.fixedHeaderName] = cfg.fixedHeaderValue;
-  }
-
-  // Authorization
-  final auth = (cfg.authMode == AuthMode.bearer) ? 'Bearer ${cfg.token}' : cfg.token;
-  h['Authorization'] = auth;
-
-  return h;
-}
-
-/// 登录接口兼容解析 token：{data:{token}} 或 {token}
-String _extractToken(dynamic loginJson) {
-  if (loginJson is Map) {
-    final data = loginJson['data'];
-    if (data is Map && data['token'] != null) return '${data['token']}';
-    if (loginJson['token'] != null) return '${loginJson['token']}';
-  }
-  return '';
 }
 
 String _prettyJsonIfPossible(String body) {
@@ -132,6 +62,31 @@ String _prettyJsonIfPossible(String body) {
   } catch (_) {
     return body;
   }
+}
+
+/// 从登录返回里提取 auth_data：{data:{auth_data:"Bearer ..."}}
+String _extractAuthData(dynamic loginJson) {
+  if (loginJson is Map) {
+    final data = loginJson['data'];
+    if (data is Map && data['auth_data'] != null) return '${data['auth_data']}';
+  }
+  return '';
+}
+
+/// 从 getSubscribe 返回里提取 subscribe_url：{data:{subscribe_url:"..."}}
+String _extractSubscribeUrl(dynamic j) {
+  if (j is Map) {
+    final data = j['data'];
+    if (data is Map && data['subscribe_url'] != null) return '${data['subscribe_url']}';
+  }
+  return '';
+}
+
+/// 从 set-cookie 提取 server_name_session=...
+String _extractSessionCookie(String? setCookie) {
+  if (setCookie == null || setCookie.isEmpty) return '';
+  final m = RegExp(r'(server_name_session=[^;]+)').firstMatch(setCookie);
+  return m?.group(1) ?? '';
 }
 
 class Home extends StatefulWidget {
@@ -146,24 +101,23 @@ class _HomeState extends State<Home> {
   final emailCtrl = TextEditingController();
   final pwdCtrl = TextEditingController();
 
-  AuthMode authMode = AuthMode.bearer; // 登录后保存（默认 Bearer）
-  final fixedHeaderNameCtrl = TextEditingController(); // 例如 hasi
-  final fixedHeaderValueCtrl = TextEditingController(); // 值
-
-  // API 调用区
+  // 自定义请求区
   HttpMethod method = HttpMethod.get;
   final pathCtrl = TextEditingController(text: '/api/v1/user/getSubscribe');
   final bodyCtrl = TextEditingController(text: '{\n  \n}');
-  String? responseText;
-  int? responseStatus;
+
   bool loading = false;
 
-  PersistedConfig? cfg;
+  String? authData; // "Bearer xxx"
+  String? lastSubscribeUrl;
+
+  int? respStatus;
+  String? respText;
 
   @override
   void initState() {
     super.initState();
-    _loadCfg();
+    _loadLocal();
   }
 
   @override
@@ -171,34 +125,53 @@ class _HomeState extends State<Home> {
     baseUrlCtrl.dispose();
     emailCtrl.dispose();
     pwdCtrl.dispose();
-    fixedHeaderNameCtrl.dispose();
-    fixedHeaderValueCtrl.dispose();
     pathCtrl.dispose();
     bodyCtrl.dispose();
     super.dispose();
   }
 
-  Future<void> _loadCfg() async {
-    final c = await Store.load();
-    if (c != null) {
-      baseUrlCtrl.text = c.baseUrl;
-      authMode = c.authMode;
-      fixedHeaderNameCtrl.text = c.fixedHeaderName;
-      fixedHeaderValueCtrl.text = c.fixedHeaderValue;
+  Future<void> _loadLocal() async {
+    final base = await Store.getBaseUrl();
+    final a = await Store.getAuthData();
+    final sub = await Store.getLastSubscribeUrl();
+
+    if (base.isNotEmpty) baseUrlCtrl.text = base;
+
+    setState(() {
+      authData = a.isEmpty ? null : a;
+      lastSubscribeUrl = sub.isEmpty ? null : sub;
+    });
+
+    // 有 authData 就自动刷新一次订阅
+    if (a.isNotEmpty && base.isNotEmpty) {
+      await fetchSubscribe(showToast: false);
     }
-    setState(() => cfg = c);
   }
 
-  Future<void> _saveCfg(PersistedConfig c) async {
-    await Store.save(c);
-    setState(() => cfg = c);
+  Map<String, String> _commonHeaders({bool json = true}) {
+    final h = <String, String>{
+      'Accept': 'application/json',
+    };
+    if (json) h['Content-Type'] = 'application/json';
+
+    // ✅ 必须：用 auth_data 原样作为 Authorization
+    final a = authData;
+    if (a != null && a.isNotEmpty) {
+      h['Authorization'] = a;
+    }
+
+    // 可选：带上会话 cookie（某些站点会检查）
+    // 这不会影响你现在的站点，即使不需要也没事
+    // 如果你不想带，可以删掉下面三行
+    // ignore: unused_local_variable
+    return h;
   }
 
   Future<void> loginAndPersist() async {
     setState(() {
       loading = true;
-      responseText = null;
-      responseStatus = null;
+      respStatus = null;
+      respText = null;
     });
 
     try {
@@ -207,53 +180,105 @@ class _HomeState extends State<Home> {
       final pwd = pwdCtrl.text;
 
       if (!base.startsWith('http://') && !base.startsWith('https://')) {
-        throw Exception('baseUrl 必须以 http:// 或 https:// 开头');
+        throw Exception('面板域名必须以 http:// 或 https:// 开头');
       }
       if (email.isEmpty || pwd.isEmpty) {
         throw Exception('请输入邮箱和密码');
       }
 
-      final h = <String, String>{
-        'Accept': 'application/json',
-        'Content-Type': 'application/json',
-      };
-
-      final fhName = fixedHeaderNameCtrl.text.trim();
-      final fhValue = fixedHeaderValueCtrl.text.trim();
-      if (fhName.isNotEmpty && fhValue.isNotEmpty) {
-        h[fhName] = fhValue;
-      }
-
       final uri = Uri.parse('$base/api/v1/passport/auth/login');
       final resp = await http
-          .post(uri, headers: h, body: jsonEncode({'email': email, 'password': pwd}))
+          .post(
+            uri,
+            headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
+            body: jsonEncode({'email': email, 'password': pwd}),
+          )
           .timeout(const Duration(seconds: 15));
 
-      responseStatus = resp.statusCode;
-      responseText = _prettyJsonIfPossible(resp.body);
+      setState(() {
+        respStatus = resp.statusCode;
+        respText = _prettyJsonIfPossible(resp.body);
+      });
 
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
         throw Exception('登录失败：HTTP ${resp.statusCode}');
       }
 
       final j = jsonDecode(resp.body);
-      final t = _extractToken(j);
-      if (t.isEmpty) {
-        throw Exception('登录成功但未解析到 token（请检查后端返回结构）');
+      final a = _extractAuthData(j);
+      if (a.isEmpty) {
+        throw Exception('登录成功但未找到 data.auth_data（后端返回结构与预期不一致）');
       }
 
-      final newCfg = PersistedConfig(
-        baseUrl: base,
-        token: t,
-        authMode: authMode,
-        fixedHeaderName: fhName,
-        fixedHeaderValue: fhValue,
-      );
+      // 保存 baseUrl + authData
+      await Store.saveBaseUrl(base);
+      await Store.saveAuthData(a);
 
-      await _saveCfg(newCfg);
+      // 保存 cookie（可选）
+      final cookie = _extractSessionCookie(resp.headers['set-cookie']);
+      if (cookie.isNotEmpty) await Store.saveCookie(cookie);
+
+      setState(() {
+        authData = a;
+      });
 
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('登录成功，已保存本地')));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('登录成功，已保存 auth_data')));
+
+      // 登录后拉一次订阅并保存
+      await fetchSubscribe(showToast: true);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('错误：$e')));
+    } finally {
+      setState(() => loading = false);
+    }
+  }
+
+  Future<void> fetchSubscribe({bool showToast = false}) async {
+    setState(() {
+      loading = true;
+      respStatus = null;
+      respText = null;
+    });
+
+    try {
+      final base = _normBaseUrl(baseUrlCtrl.text);
+      final a = authData ?? await Store.getAuthData();
+      if (a.isEmpty) throw Exception('未登录：请先登录');
+
+      // headers：Authorization=auth_data
+      final headers = <String, String>{
+        'Accept': 'application/json',
+        'Authorization': a,
+      };
+
+      // 可选：带 cookie
+      final cookie = await Store.getCookie();
+      if (cookie.isNotEmpty) headers['Cookie'] = cookie;
+
+      final uri = Uri.parse('$base/api/v1/user/getSubscribe');
+      final resp = await http.get(uri, headers: headers).timeout(const Duration(seconds: 15));
+
+      setState(() {
+        respStatus = resp.statusCode;
+        respText = _prettyJsonIfPossible(resp.body);
+      });
+
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw Exception('获取订阅失败：HTTP ${resp.statusCode}');
+      }
+
+      final j = jsonDecode(resp.body);
+      final sub = _extractSubscribeUrl(j);
+      if (sub.isEmpty) throw Exception('返回里未找到 data.subscribe_url');
+
+      await Store.saveLastSubscribeUrl(sub);
+      setState(() => lastSubscribeUrl = sub);
+
+      if (showToast && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已获取最新订阅链接')));
+      }
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('错误：$e')));
@@ -263,79 +288,80 @@ class _HomeState extends State<Home> {
   }
 
   Future<void> callApi() async {
-    final c = cfg;
-    if (c == null) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先登录并保存 token')));
+    final base = _normBaseUrl(baseUrlCtrl.text);
+    final path = pathCtrl.text.trim();
+    final a = authData ?? await Store.getAuthData();
+    if (a.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('请先登录获取 auth_data')));
+      return;
+    }
+    if (!path.startsWith('/')) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('路径必须以 / 开头')));
       return;
     }
 
     setState(() {
       loading = true;
-      responseText = null;
-      responseStatus = null;
+      respStatus = null;
+      respText = null;
     });
 
     try {
-      final base = _normBaseUrl(c.baseUrl);
-      final path = pathCtrl.text.trim();
-      if (!path.startsWith('/')) {
-        throw Exception('路径必须以 / 开头，例如 /api/v1/user/getSubscribe');
-      }
-
       final uri = Uri.parse('$base$path');
-      final h = _headersFromCfg(c);
+      final headers = <String, String>{
+        'Accept': 'application/json',
+        'Authorization': a, // ✅ auth_data 原样
+        'Content-Type': 'application/json',
+      };
+      final cookie = await Store.getCookie();
+      if (cookie.isNotEmpty) headers['Cookie'] = cookie;
 
       http.Response resp;
       switch (method) {
         case HttpMethod.get:
-          resp = await http.get(uri, headers: h).timeout(const Duration(seconds: 20));
+          resp = await http.get(uri, headers: headers).timeout(const Duration(seconds: 20));
           break;
         case HttpMethod.delete:
-          resp = await http.delete(uri, headers: h).timeout(const Duration(seconds: 20));
+          resp = await http.delete(uri, headers: headers).timeout(const Duration(seconds: 20));
           break;
         case HttpMethod.post:
           resp = await http
-              .post(uri, headers: h, body: bodyCtrl.text.isEmpty ? '{}' : bodyCtrl.text)
+              .post(uri, headers: headers, body: bodyCtrl.text.isEmpty ? '{}' : bodyCtrl.text)
               .timeout(const Duration(seconds: 20));
           break;
         case HttpMethod.put:
           resp = await http
-              .put(uri, headers: h, body: bodyCtrl.text.isEmpty ? '{}' : bodyCtrl.text)
+              .put(uri, headers: headers, body: bodyCtrl.text.isEmpty ? '{}' : bodyCtrl.text)
               .timeout(const Duration(seconds: 20));
           break;
       }
 
       setState(() {
-        responseStatus = resp.statusCode;
-        responseText = _prettyJsonIfPossible(resp.body);
+        respStatus = resp.statusCode;
+        respText = _prettyJsonIfPossible(resp.body);
       });
     } catch (e) {
-      setState(() => responseText = 'Exception: $e');
+      setState(() => respText = 'Exception: $e');
     } finally {
       setState(() => loading = false);
     }
   }
 
-  Future<void> updateAuthMode(AuthMode m) async {
-    setState(() => authMode = m);
-    final c = cfg;
-    if (c != null) {
-      await _saveCfg(PersistedConfig(
-        baseUrl: c.baseUrl,
-        token: c.token,
-        authMode: m,
-        fixedHeaderName: c.fixedHeaderName,
-        fixedHeaderValue: c.fixedHeaderValue,
-      ));
-    }
+  Future<void> copySubscribe() async {
+    final s = lastSubscribeUrl;
+    if (s == null || s.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: s));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已复制订阅链接')));
   }
 
   Future<void> clearLocal() async {
     await Store.clear();
     setState(() {
-      cfg = null;
-      responseText = null;
-      responseStatus = null;
+      authData = null;
+      lastSubscribeUrl = null;
+      respStatus = null;
+      respText = null;
     });
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('已清空本地保存')));
@@ -343,14 +369,19 @@ class _HomeState extends State<Home> {
 
   @override
   Widget build(BuildContext context) {
-    final saved = cfg != null;
+    final loggedIn = (authData != null && authData!.isNotEmpty);
 
     return Scaffold(
       appBar: AppBar(
         title: const Text('XBoard API 工具'),
         actions: [
           IconButton(
-            tooltip: '清空本地保存',
+            tooltip: '刷新订阅',
+            onPressed: loading ? null : () => fetchSubscribe(showToast: true),
+            icon: const Icon(Icons.refresh),
+          ),
+          IconButton(
+            tooltip: '清空本地',
             onPressed: loading ? null : clearLocal,
             icon: const Icon(Icons.delete_outline),
           ),
@@ -360,7 +391,6 @@ class _HomeState extends State<Home> {
         padding: const EdgeInsets.all(16),
         child: ListView(
           children: [
-            // ===== 登录区 =====
             const Text('登录', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
             TextField(
@@ -379,55 +409,40 @@ class _HomeState extends State<Home> {
               decoration: const InputDecoration(labelText: '密码'),
               obscureText: true,
             ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                const Text('Authorization 模式：'),
-                const SizedBox(width: 8),
-                DropdownButton<AuthMode>(
-                  value: authMode,
-                  onChanged: loading ? null : (v) => v == null ? null : updateAuthMode(v),
-                  items: const [
-                    DropdownMenuItem(value: AuthMode.bearer, child: Text('Bearer token')),
-                    DropdownMenuItem(value: AuthMode.plain, child: Text('Plain token')),
-                  ],
-                ),
-              ],
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: fixedHeaderNameCtrl,
-                    decoration: const InputDecoration(labelText: '固定 Header 名（可选，例如 hasi）'),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: TextField(
-                    controller: fixedHeaderValueCtrl,
-                    decoration: const InputDecoration(labelText: '固定 Header 值（可选）'),
-                  ),
-                ),
-              ],
-            ),
             const SizedBox(height: 10),
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
                 onPressed: loading ? null : loginAndPersist,
-                child: Text(loading ? '处理中...' : '登录并保存到本地'),
+                child: Text(loading ? '处理中...' : '登录并保存到本地（使用 auth_data）'),
               ),
             ),
-            if (saved) ...[
-              const SizedBox(height: 6),
-              const Text('✅ 已保存 token（重启 App 仍然有效）', style: TextStyle(color: Colors.green)),
+            const SizedBox(height: 8),
+            Text(
+              loggedIn ? '✅ 已保存 auth_data（重启 App 仍然有效）' : '未登录',
+              style: TextStyle(color: loggedIn ? Colors.green : Colors.black54),
+            ),
+
+            const Divider(height: 28),
+
+            const Text('订阅链接', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 8),
+            if (lastSubscribeUrl != null) ...[
+              SelectableText(lastSubscribeUrl!),
+              const SizedBox(height: 10),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton(
+                  onPressed: copySubscribe,
+                  child: const Text('复制订阅链接'),
+                ),
+              ),
+            ] else ...[
+              const Text('暂无（登录后点右上角刷新或直接请求 getSubscribe）'),
             ],
 
-            const Divider(height: 32),
+            const Divider(height: 28),
 
-            // ===== API 调用区 =====
             const Text('自定义 API 请求', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
             const SizedBox(height: 8),
             Row(
@@ -467,15 +482,15 @@ class _HomeState extends State<Home> {
             SizedBox(
               width: double.infinity,
               child: OutlinedButton(
-                onPressed: (!saved || loading) ? null : callApi,
+                onPressed: (!loggedIn || loading) ? null : callApi,
                 child: Text(loading ? '请求中...' : '发送请求并输出返回'),
               ),
             ),
 
             const SizedBox(height: 16),
-            if (responseStatus != null)
-              Text('HTTP Status: $responseStatus', style: const TextStyle(fontWeight: FontWeight.w700)),
-            if (responseText != null) ...[
+            if (respStatus != null)
+              Text('HTTP Status: $respStatus', style: const TextStyle(fontWeight: FontWeight.w700)),
+            if (respText != null) ...[
               const SizedBox(height: 8),
               Container(
                 padding: const EdgeInsets.all(12),
@@ -483,7 +498,7 @@ class _HomeState extends State<Home> {
                   border: Border.all(color: Colors.black12),
                   borderRadius: BorderRadius.circular(12),
                 ),
-                child: SelectableText(responseText!),
+                child: SelectableText(respText!),
               ),
             ],
           ],
