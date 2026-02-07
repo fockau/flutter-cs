@@ -19,63 +19,141 @@ class XBoardClientApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'King',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        colorSchemeSeed: const Color(0xFF7A5CFF),
         brightness: Brightness.dark,
+        colorSchemeSeed: const Color(0xFF7A5CFF),
       ),
-      // 默认直接进认证页
-      home: const AuthGate(),
-      debugShowCheckedModeBanner: false,
+      home: const BootGate(),
     );
   }
 }
 
-/// 启动路由：永远先去认证页
-/// - 如果本地有 token，也可以选择自动尝试拉订阅后再进 Home（这里我给你做成：先认证页，避免你说的延迟感/跳动）
-/// - 你想“有 token 就直接进 Home”的话我也可以给你改
-class AuthGate extends StatefulWidget {
-  const AuthGate({super.key});
+/// 启动逻辑：
+/// 1) 本地有 token/auth_data => 自动请求 /user/getSubscribe
+///    - 成功：直接进 HomePage（带首次订阅数据，避免再请求一次）
+///    - 失败/403：清理 token -> 进 AuthPage（force=true）
+/// 2) 本地无 token => 直接进 AuthPage（force=true）
+class BootGate extends StatefulWidget {
+  const BootGate({super.key});
 
   @override
-  State<AuthGate> createState() => _AuthGateState();
+  State<BootGate> createState() => _BootGateState();
 }
 
-class _AuthGateState extends State<AuthGate> {
+class _BootGateState extends State<BootGate> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _goAuthFirst());
+    WidgetsBinding.instance.addPostFrameCallback((_) => _boot());
   }
 
-  Future<void> _goAuthFirst() async {
+  Future<void> _boot() async {
+    final s = LocalStore.I;
+    final hasToken = s.authData.trim().isNotEmpty;
+
+    if (hasToken) {
+      final firstData = await _tryFetchSubscribeWithSavedAuth();
+      if (firstData != null) {
+        if (!mounted) return;
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(builder: (_) => HomePage(initialSubscribeData: firstData)),
+        );
+        return;
+      }
+      // token 失效/异常：走认证
+    }
+
+    await _goAuth(force: true);
+  }
+
+  Future<Map<String, dynamic>?> _tryFetchSubscribeWithSavedAuth() async {
+    try {
+      await ConfigManager.I.refreshRemoteConfigAndRace();
+
+      final headers = <String, String>{'Accept': 'application/json'};
+      final auth = LocalStore.I.authData.trim();
+      final cookie = LocalStore.I.cookie.trim();
+      if (auth.isNotEmpty) headers['Authorization'] = auth;
+      if (cookie.isNotEmpty) headers['Cookie'] = cookie;
+
+      final uri = ConfigManager.I.api('/user/getSubscribe');
+      final resp = await http.get(uri, headers: headers).timeout(const Duration(seconds: 18));
+
+      dynamic j;
+      try {
+        j = jsonDecode(resp.body);
+      } catch (_) {
+        throw Exception('返回不是 JSON：${resp.body}');
+      }
+
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        final msg = (j is Map && j['message'] != null) ? j['message'].toString() : 'HTTP ${resp.statusCode}';
+        throw Exception('$msg');
+      }
+
+      if (j is! Map) throw Exception('返回不是对象');
+      final data = j['data'];
+      if (data is! Map) throw Exception('data 不是对象');
+
+      return Map<String, dynamic>.from(data);
+    } catch (e) {
+      final es = e.toString();
+      final needReauth =
+          es.contains('403') || es.contains('未登录') || es.contains('登陆已过期') || es.contains('登录已过期');
+
+      if (needReauth) {
+        await LocalStore.I.clearAuth();
+      }
+      return null;
+    }
+  }
+
+  Future<void> _goAuth({required bool force}) async {
     final s = LocalStore.I;
 
-    final res = await Navigator.of(context).pushReplacement<AuthResult?>(
+    final res = await Navigator.of(context).pushReplacement(
       AuthPage.route(
-        force: true, // 启动必须登录：不可返回
+        force: force,
         initialEmail: s.email,
         initialPassword: s.password,
       ),
-    );
+    ) as AuthResult?;
 
     if (res == null) return;
 
-    await s.saveAuth(email: res.email, password: res.password, authData: res.authData, cookie: res.cookie);
+    await s.saveAuth(
+      email: res.email,
+      password: res.password,
+      authData: res.authData,
+      cookie: res.cookie,
+    );
+
+    // 登录后：立即拉一次订阅（确保主页显示最新）
+    Map<String, dynamic>? first;
+    try {
+      first = await _tryFetchSubscribeWithSavedAuth();
+    } catch (_) {}
 
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const HomePage()));
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => HomePage(initialSubscribeData: first)),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    // 这个页面不会被看到（只是过渡），给个纯黑占位
+    // 纯黑启动占位，减少“跳一下”的观感
     return const Scaffold(backgroundColor: Colors.black);
   }
 }
 
+/// 登录后主页：显示订阅链接 + 原始 JSON，支持刷新与退出
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  final Map<String, dynamic>? initialSubscribeData;
+  const HomePage({super.key, this.initialSubscribeData});
+
   @override
   State<HomePage> createState() => _HomePageState();
 }
@@ -90,15 +168,21 @@ class _HomePageState extends State<HomePage> {
 
   Map<String, String> _authHeaders() {
     final h = <String, String>{'Accept': 'application/json'};
-    if (_authData.isNotEmpty) h['Authorization'] = _authData;
-    if (_cookie.isNotEmpty) h['Cookie'] = _cookie;
+    if (_authData.trim().isNotEmpty) h['Authorization'] = _authData.trim();
+    if (_cookie.trim().isNotEmpty) h['Cookie'] = _cookie.trim();
     return h;
   }
 
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _fetchSubscribe());
+    // 使用启动时预取的数据，避免进主页又空一下
+    subscribeData = widget.initialSubscribeData;
+
+    // 如果没有预取数据，再自动拉一次
+    if (subscribeData == null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => _fetchSubscribe());
+    }
   }
 
   Future<void> _fetchSubscribe() async {
@@ -109,13 +193,20 @@ class _HomePageState extends State<HomePage> {
 
     try {
       await ConfigManager.I.refreshRemoteConfigAndRace();
-      final uri = ConfigManager.I.api('/user/getSubscribe');
 
+      final uri = ConfigManager.I.api('/user/getSubscribe');
       final resp = await http.get(uri, headers: _authHeaders()).timeout(const Duration(seconds: 20));
-      final j = jsonDecode(resp.body);
+
+      dynamic j;
+      try {
+        j = jsonDecode(resp.body);
+      } catch (_) {
+        throw Exception('返回不是 JSON：${resp.body}');
+      }
 
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
-        throw Exception('HTTP ${resp.statusCode}: ${j is Map ? (j['message'] ?? resp.body) : resp.body}');
+        final msg = (j is Map && j['message'] != null) ? j['message'].toString() : 'HTTP ${resp.statusCode}';
+        throw Exception('$msg\n${resp.body}');
       }
 
       if (j is! Map) throw Exception('返回不是对象');
@@ -127,7 +218,10 @@ class _HomePageState extends State<HomePage> {
       setState(() => lastError = '获取订阅失败：$e');
 
       final es = e.toString();
-      if (es.contains('403') || es.contains('未登录') || es.contains('登陆已过期')) {
+      final needReauth =
+          es.contains('403') || es.contains('未登录') || es.contains('登陆已过期') || es.contains('登录已过期');
+
+      if (needReauth) {
         await LocalStore.I.clearAuth();
         if (!mounted) return;
         Navigator.of(context).pushReplacement(AuthPage.route(force: true));
@@ -151,8 +245,16 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('订阅信息'),
         actions: [
-          IconButton(onPressed: busy ? null : _fetchSubscribe, icon: const Icon(Icons.refresh)),
-          IconButton(onPressed: busy ? null : _logout, icon: const Icon(Icons.logout)),
+          IconButton(
+            tooltip: '刷新',
+            onPressed: busy ? null : _fetchSubscribe,
+            icon: const Icon(Icons.refresh),
+          ),
+          IconButton(
+            tooltip: '退出登录',
+            onPressed: busy ? null : _logout,
+            icon: const Icon(Icons.logout),
+          ),
         ],
       ),
       body: Padding(
@@ -169,7 +271,10 @@ class _HomePageState extends State<HomePage> {
                     const Text('订阅链接', style: TextStyle(fontWeight: FontWeight.w700)),
                     const SizedBox(height: 10),
                     SelectableText(subUrl.isEmpty ? '暂无（请刷新）' : subUrl),
-                    if (busy) const Padding(padding: EdgeInsets.only(top: 10), child: LinearProgressIndicator(minHeight: 3)),
+                    if (busy) ...[
+                      const SizedBox(height: 10),
+                      const LinearProgressIndicator(minHeight: 3),
+                    ],
                   ],
                 ),
               ),
