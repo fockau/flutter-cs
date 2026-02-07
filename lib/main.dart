@@ -4,7 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'config.dart';
+import 'config_manager.dart';
 import 'auth_dialog.dart';
 
 void main() => runApp(const App());
@@ -22,16 +22,12 @@ class App extends StatelessWidget {
   }
 }
 
-String _trimSlash(String s) {
-  s = s.trim();
-  while (s.endsWith('/')) s = s.substring(0, s.length - 1);
-  return s;
-}
-
 Uri _apiV1(String pathUnderApiV1) {
-  final api = _trimSlash(AppConfig.apiBaseUrl);
-  if (!pathUnderApiV1.startsWith('/')) pathUnderApiV1 = '/$pathUnderApiV1';
-  return Uri.parse('$api/api/v1$pathUnderApiV1');
+  final base = ConfigManager.I.apiBaseUrl;
+  final prefix = ConfigManager.I.apiPrefix;
+  var p = pathUnderApiV1;
+  if (!p.startsWith('/')) p = '/$p';
+  return Uri.parse('$base$prefix$p');
 }
 
 String _prettyJsonIfPossible(String body) {
@@ -52,12 +48,10 @@ String _extractSubscribeUrl(dynamic j) {
   return '';
 }
 
-String _extractAuthData(dynamic j) {
-  if (j is Map) {
-    final data = j['data'];
-    if (data is Map && data['auth_data'] != null) return '${data['auth_data']}';
-    if (data is Map && data['token'] != null) return 'Bearer ${data['token']}';
-  }
+String _extractAuthData(Map<String, dynamic> j) {
+  final data = j['data'];
+  if (data is Map && data['auth_data'] != null) return '${data['auth_data']}';
+  if (data is Map && data['token'] != null) return 'Bearer ${data['token']}';
   return '';
 }
 
@@ -69,7 +63,7 @@ String _extractSessionCookie(String? setCookie) {
 
 class Store {
   static const _kEmail = 'email';
-  static const _kPassword = 'password'; // 你要求默认保存
+  static const _kPassword = 'password';
   static const _kAuthData = 'auth_data';
   static const _kCookie = 'cookie';
   static const _kSubscribeUrl = 'subscribe_url';
@@ -145,7 +139,26 @@ class _HomeState extends State<Home> {
     return h;
   }
 
+  Future<Map<String, dynamic>> _parseJson(http.Response resp) async {
+    try {
+      final decoded = jsonDecode(resp.body);
+      if (decoded is Map<String, dynamic>) return decoded;
+      throw Exception('Unexpected JSON type');
+    } catch (_) {
+      throw Exception('后端返回不是 JSON：HTTP ${resp.statusCode}\n${resp.body}');
+    }
+  }
+
+  String _formatApiError(Map<String, dynamic> j, int statusCode) {
+    final msg = j['message']?.toString() ?? 'HTTP $statusCode';
+    final errs = j['errors'];
+    if (errs == null) return msg;
+    return '$msg\n$errs';
+  }
+
   Future<void> _boot() async {
+    await ConfigManager.I.init(); // ✅ 初始化远程配置 + 域名竞速
+
     email = await Store.email();
     password = await Store.password();
     authData = await Store.authData();
@@ -158,8 +171,7 @@ class _HomeState extends State<Home> {
       if (email.isNotEmpty && password.isNotEmpty) {
         await _autoLoginAndFetch();
       }
-
-      // ✅ 强制弹登录弹窗：未登录则不允许退出
+      // 未登录：强制弹窗
       if (authData.isEmpty) {
         await _openAuthDialog(forceLogin: true);
       }
@@ -171,11 +183,14 @@ class _HomeState extends State<Home> {
       await _loginWithSavedCreds();
       await fetchSubscribe(showToast: false);
     } catch (_) {
-      // 不吵
+      // ignore
     }
   }
 
   Future<void> _loginWithSavedCreds() async {
+    // 每次自动登录前也可以刷新一次竞速（可选）
+    await ConfigManager.I.refreshRemoteConfigAndRace();
+
     final resp = await http
         .post(
           _apiV1('/passport/auth/login'),
@@ -188,11 +203,11 @@ class _HomeState extends State<Home> {
     respText = _prettyJsonIfPossible(resp.body);
     setState(() {});
 
+    final j = await _parseJson(resp);
     if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      throw Exception('自动登录失败：HTTP ${resp.statusCode}');
+      throw Exception(_formatApiError(j, resp.statusCode));
     }
 
-    final j = jsonDecode(resp.body);
     final a = _extractAuthData(j);
     if (a.isEmpty) throw Exception('自动登录缺少 data.auth_data');
     authData = a;
@@ -247,17 +262,19 @@ class _HomeState extends State<Home> {
     });
 
     try {
-      final resp = await http.get(_apiV1('/user/getSubscribe'), headers: _headers()).timeout(const Duration(seconds: 15));
+      final resp = await http
+          .get(_apiV1('/user/getSubscribe'), headers: _headers())
+          .timeout(const Duration(seconds: 15));
 
       respStatus = resp.statusCode;
       respText = _prettyJsonIfPossible(resp.body);
       setState(() {});
 
+      final j = await _parseJson(resp);
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
-        throw Exception('获取订阅失败：HTTP ${resp.statusCode}');
+        throw Exception(_formatApiError(j, resp.statusCode));
       }
 
-      final j = jsonDecode(resp.body);
       final sub = _extractSubscribeUrl(j);
       if (sub.isNotEmpty) subscribeUrl = sub;
 
@@ -279,7 +296,9 @@ class _HomeState extends State<Home> {
       }
       setState(() {});
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('错误：$e')));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('错误：$e')));
+      }
     } finally {
       setState(() => loading = false);
     }
@@ -303,6 +322,7 @@ class _HomeState extends State<Home> {
     respText = null;
     lastFetchedAtMs = 0;
     setState(() {});
+
     if (mounted) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _openAuthDialog(forceLogin: true));
     }
@@ -342,9 +362,8 @@ class _HomeState extends State<Home> {
           children: [
             Card(
               child: ListTile(
-                title: Text(loggedIn ? '已登录：$email' : '未登录（将强制弹窗）'),
-                subtitle: Text('网站：${AppConfig.siteBaseUrl}\nAPI：${AppConfig.apiBaseUrl}'),
-                isThreeLine: true,
+                title: Text(loggedIn ? '已登录：$email' : '未登录'),
+                subtitle: Text('最后刷新：${_fmtTime(lastFetchedAtMs)}'),
               ),
             ),
             const SizedBox(height: 12),
@@ -366,10 +385,8 @@ class _HomeState extends State<Home> {
                   ),
                 ],
               ),
-              const SizedBox(height: 6),
-              Text('最后刷新：${_fmtTime(lastFetchedAtMs)}', style: const TextStyle(color: Colors.black54)),
             ] else ...[
-              const Text('暂无（登录后会自动获取 /api/v1/user/getSubscribe）'),
+              const Text('暂无（登录后会自动获取 /user/getSubscribe）'),
             ],
 
             const SizedBox(height: 18),
