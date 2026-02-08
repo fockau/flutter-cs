@@ -3,13 +3,12 @@ import 'package:url_launcher/url_launcher.dart';
 
 import 'app_storage.dart';
 import 'home_page.dart';
-import 'session_service.dart';
 import 'xboard_api.dart';
 
 enum AuthTab { login, register, reset }
 
 class AuthPage extends StatefulWidget {
-  final bool force;
+  final bool force; // force=true：未登录不可返回/不可关闭
   const AuthPage({super.key, required this.force});
 
   @override
@@ -19,21 +18,19 @@ class AuthPage extends StatefulWidget {
 class _AuthPageState extends State<AuthPage> {
   AuthTab tab = AuthTab.login;
 
-  // guest config
   GuestConfigParsed guest = const GuestConfigParsed(isEmailVerify: 0, emailWhitelistSuffix: []);
   bool loadingGuest = true;
 
-  // common state
   bool busy = false;
   String? err;
 
-  // login form
+  // login
   final _loginKey = GlobalKey<FormState>();
   final loginEmailCtrl = TextEditingController();
   final loginPwdCtrl = TextEditingController();
   bool rememberPwd = true;
 
-  // register form
+  // register
   final _regKey = GlobalKey<FormState>();
   final regEmailPrefixCtrl = TextEditingController();
   String? regEmailSuffix;
@@ -44,7 +41,7 @@ class _AuthPageState extends State<AuthPage> {
   final regEmailCodeCtrl = TextEditingController();
   bool regPwdTouched = false;
 
-  // reset form
+  // reset
   final _resetKey = GlobalKey<FormState>();
   final resetEmailPrefixCtrl = TextEditingController();
   String? resetEmailSuffix;
@@ -60,12 +57,26 @@ class _AuthPageState extends State<AuthPage> {
   void initState() {
     super.initState();
 
-    // prefill login
-    loginEmailCtrl.text = SessionService.I.email;
-    rememberPwd = SessionService.I.rememberPassword;
-    if (rememberPwd) loginPwdCtrl.text = SessionService.I.password;
+    // 预填登录信息
+    loginEmailCtrl.text = XBoardApi.I.email;
+    rememberPwd = XBoardApi.I.rememberPassword;
+    if (rememberPwd) loginPwdCtrl.text = XBoardApi.I.password;
 
-    _loadGuestConfig();
+    // 先把 guest config 从缓存读出来（UI 秒出）
+    final cached = AppStorage.I.getJson(AppStorage.kGuestConfigCache);
+    if (cached != null) {
+      final isEv = (cached['is_email_verify'] is num) ? (cached['is_email_verify'] as num).toInt() : 0;
+      final wl = (cached['email_whitelist_suffix'] is List)
+          ? (cached['email_whitelist_suffix'] as List).map((e) => e.toString()).toList()
+          : <String>[];
+      guest = GuestConfigParsed(isEmailVerify: isEv, emailWhitelistSuffix: wl);
+      if (guest.emailWhitelistSuffix.isNotEmpty) {
+        regEmailSuffix ??= guest.emailWhitelistSuffix.first;
+        resetEmailSuffix ??= guest.emailWhitelistSuffix.first;
+      }
+    }
+
+    _reloadAll();
   }
 
   @override
@@ -97,40 +108,38 @@ class _AuthPageState extends State<AuthPage> {
     await launchUrl(uri, mode: LaunchMode.externalApplication);
   }
 
-  Future<void> _loadGuestConfig() async {
-    setState(() => loadingGuest = true);
+  Future<void> _reloadAll() async {
+    setState(() {
+      loadingGuest = true;
+      err = null;
+    });
 
-    // 先读缓存（秒出 UI）
-    final cached = AppStorage.I.getJson(AppStorage.kGuestConfigCache);
-    if (cached != null) {
-      final isEv = (cached['is_email_verify'] is num) ? (cached['is_email_verify'] as num).toInt() : 0;
-      final wl = (cached['email_whitelist_suffix'] is List)
-          ? (cached['email_whitelist_suffix'] as List).map((e) => e.toString()).toList()
-          : <String>[];
-      guest = GuestConfigParsed(isEmailVerify: isEv, emailWhitelistSuffix: wl);
-    }
-
-    // 后台刷新真实配置（不阻塞）
     try {
-      await XBoardApi.I.initResolveDomain();
+      await XBoardApi.I.refreshDomainRacer(); // 重新竞速（刷新按钮也会走这条）
       final g = await XBoardApi.I.fetchGuestConfig();
       guest = g;
       await AppStorage.I.setJson(AppStorage.kGuestConfigCache, g.toJson());
 
-      // 默认选第一个 suffix（如果存在）
       if (guest.emailWhitelistSuffix.isNotEmpty) {
         regEmailSuffix ??= guest.emailWhitelistSuffix.first;
         resetEmailSuffix ??= guest.emailWhitelistSuffix.first;
       }
-    } catch (_) {
-      // 拉不到也不阻塞登录（只影响注册/找回的白名单与验证码按钮）
+    } catch (e) {
+      // guest 拉不到，不阻塞登录，但会影响注册/找回的动态显示
+      err = '联通检测失败：${e.toString()}';
     } finally {
-      if (mounted) setState(() => loadingGuest = false);
+      if (mounted) {
+        setState(() => loadingGuest = false);
+      }
     }
   }
 
   // ---------- helpers ----------
-  String _buildEmail({required TextEditingController plain, required TextEditingController prefix, required String? suffix}) {
+  String _buildEmail({
+    required TextEditingController plain,
+    required TextEditingController prefix,
+    required String? suffix,
+  }) {
     if (!hasWhitelist) return plain.text.trim();
     final p = prefix.text.trim();
     final s = (suffix ?? '').trim();
@@ -191,26 +200,20 @@ class _AuthPageState extends State<AuthPage> {
           child: TextFormField(
             controller: prefixCtrl,
             enabled: enabled,
-            decoration: const InputDecoration(
-              labelText: '邮箱前缀',
-              border: OutlineInputBorder(),
-            ),
+            decoration: const InputDecoration(labelText: '邮箱前缀', border: OutlineInputBorder()),
             validator: _vEmailPrefix,
           ),
         ),
         const SizedBox(width: 10),
         SizedBox(
-          width: 140, // 更紧凑的小下拉
+          width: 140,
           child: DropdownButtonFormField<String>(
             value: suffixValue ?? (guest.emailWhitelistSuffix.isNotEmpty ? guest.emailWhitelistSuffix.first : null),
             items: guest.emailWhitelistSuffix
                 .map((e) => DropdownMenuItem<String>(value: e, child: Text('@$e', overflow: TextOverflow.ellipsis)))
                 .toList(),
             onChanged: enabled ? onSuffixChanged : null,
-            decoration: const InputDecoration(
-              labelText: '后缀',
-              border: OutlineInputBorder(),
-            ),
+            decoration: const InputDecoration(labelText: '后缀', border: OutlineInputBorder()),
           ),
         ),
       ],
@@ -227,32 +230,28 @@ class _AuthPageState extends State<AuthPage> {
     try {
       if (!_loginKey.currentState!.validate()) return;
 
-      await XBoardApi.I.initResolveDomain();
-      final j = await XBoardApi.I.login(email: loginEmailCtrl.text.trim(), password: loginPwdCtrl.text);
-
-      final data = j['data'];
-      if (data is! Map) throw Exception('登录返回缺少 data');
-
-      String auth = '';
-      if (data['auth_data'] != null) auth = data['auth_data'].toString();
-      if (auth.isEmpty && data['token'] != null) auth = 'Bearer ${data['token']}';
-      if (auth.isEmpty) throw Exception('登录成功但缺少 auth_data');
-
-      await SessionService.I.saveLogin(
+      final j = await XBoardApi.I.login(
         email: loginEmailCtrl.text.trim(),
         password: loginPwdCtrl.text,
-        authData: auth,
-        cookie: '', // cookie 暂不强依赖
-        rememberPassword: rememberPwd,
       );
 
-      // 立刻拉订阅 + 缓存（主页秒出）
+      // 保存登录（不自动带 cookie，Authorization 足够）
+      await XBoardApi.I.saveLoginFromResponse(
+        loginEmailCtrl.text.trim(),
+        loginPwdCtrl.text,
+        j,
+        rememberPwd,
+      );
+
+      // 拉订阅 + 缓存
       final sub = await XBoardApi.I.getSubscribe();
       final subData = (sub['data'] is Map) ? Map<String, dynamic>.from(sub['data']) : <String, dynamic>{};
       await AppStorage.I.setJson(AppStorage.kSubscribeCache, subData);
 
       if (!mounted) return;
-      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => HomePage(initialSubscribeCache: subData)));
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (_) => HomePage(initialSubscribeCache: subData)),
+      );
     } catch (e) {
       setState(() => err = e.toString());
     } finally {
@@ -271,6 +270,7 @@ class _AuthPageState extends State<AuthPage> {
       if (email.isEmpty) throw Exception('邮箱不完整');
 
       await XBoardApi.I.sendEmailCode(email: email, scene: 'register');
+      setState(() => err = '验证码已发送，请查收邮箱');
     } catch (e) {
       setState(() => err = e.toString());
     } finally {
@@ -290,7 +290,6 @@ class _AuthPageState extends State<AuthPage> {
       final email = _buildEmail(plain: regEmailPlainCtrl, prefix: regEmailPrefixCtrl, suffix: regEmailSuffix);
       if (email.isEmpty) throw Exception('邮箱不完整');
 
-      // is_email_verify==1 时，需要验证码（否则不显示也不传）
       final emailCode = (guest.isEmailVerify == 1) ? regEmailCodeCtrl.text.trim() : null;
 
       await XBoardApi.I.register(
@@ -300,11 +299,10 @@ class _AuthPageState extends State<AuthPage> {
         emailCode: emailCode,
       );
 
-      // ✅ 注册成功：不自动登录，回登录 Tab
+      // 注册成功：不自动登录，回登录
       setState(() {
         tab = AuthTab.login;
         err = '注册成功，请登录';
-        // 预填邮箱
         loginEmailCtrl.text = email;
       });
     } catch (e) {
@@ -325,6 +323,7 @@ class _AuthPageState extends State<AuthPage> {
       if (email.isEmpty) throw Exception('邮箱不完整');
 
       await XBoardApi.I.sendEmailCode(email: email, scene: 'reset_password');
+      setState(() => err = '验证码已发送，请查收邮箱');
     } catch (e) {
       setState(() => err = e.toString());
     } finally {
@@ -344,9 +343,8 @@ class _AuthPageState extends State<AuthPage> {
       final email = _buildEmail(plain: resetEmailPlainCtrl, prefix: resetEmailPrefixCtrl, suffix: resetEmailSuffix);
       if (email.isEmpty) throw Exception('邮箱不完整');
 
-      // 只有 is_email_verify==1 才会显示验证码输入（没开启就不该走这里）
       if (guest.isEmailVerify != 1) {
-        throw Exception('当前未开启邮箱验证码，无法重置密码');
+        throw Exception('当前站点未开启邮箱验证，请联系管理员重置密码。');
       }
 
       final code = resetCodeCtrl.text.trim();
@@ -358,7 +356,6 @@ class _AuthPageState extends State<AuthPage> {
         emailCode: code,
       );
 
-      // ✅ 重置成功：不自动登录，回登录 Tab
       setState(() {
         tab = AuthTab.login;
         err = '密码重置成功，请登录';
@@ -376,7 +373,7 @@ class _AuthPageState extends State<AuthPage> {
   Widget build(BuildContext context) {
     final title = switch (tab) {
       AuthTab.login => '登录',
-      AuthTab.register => '注册',
+      AuthTab.register => '注册帐号',
       AuthTab.reset => '找回密码',
     };
 
@@ -387,7 +384,7 @@ class _AuthPageState extends State<AuthPage> {
         body: SafeArea(
           child: Center(
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 440),
+              constraints: const BoxConstraints(maxWidth: 460),
               child: Padding(
                 padding: const EdgeInsets.all(18),
                 child: Column(
@@ -397,12 +394,22 @@ class _AuthPageState extends State<AuthPage> {
                       children: [
                         Text(title, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w800)),
                         const Spacer(),
+
+                        IconButton(
+                          tooltip: '刷新',
+                          onPressed: busy ? null : _reloadAll,
+                          icon: const Icon(Icons.refresh),
+                        ),
+                        const SizedBox(width: 6),
+
                         TextButton(
-                          onPressed: () => _openExternal(XBoardApi.I.ready ? XBoardApi.I.supportUrl : ''),
+                          onPressed: () => _openExternal(XBoardApi.I.supportUrl),
                           child: const Text('客服'),
                         ),
+                        const SizedBox(width: 6),
+
                         TextButton(
-                          onPressed: () => _openExternal(XBoardApi.I.ready ? XBoardApi.I.websiteUrl : ''),
+                          onPressed: () => _openExternal(XBoardApi.I.websiteUrl),
                           child: const Text('官网'),
                         ),
                       ],
@@ -429,15 +436,21 @@ class _AuthPageState extends State<AuthPage> {
                       Container(
                         padding: const EdgeInsets.all(10),
                         decoration: BoxDecoration(
-                          color: (err!.contains('成功') ? Colors.green : Colors.red).withOpacity(0.12),
+                          color: (err!.contains('成功') || err!.contains('已发送') ? Colors.green : Colors.red)
+                              .withOpacity(0.12),
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(
-                            color: (err!.contains('成功') ? Colors.green : Colors.red).withOpacity(0.3),
+                            color: (err!.contains('成功') || err!.contains('已发送') ? Colors.green : Colors.red)
+                                .withOpacity(0.3),
                           ),
                         ),
                         child: Text(
                           err!,
-                          style: TextStyle(color: err!.contains('成功') ? Colors.greenAccent : Colors.redAccent),
+                          style: TextStyle(
+                            color: err!.contains('成功') || err!.contains('已发送')
+                                ? Colors.greenAccent
+                                : Colors.redAccent,
+                          ),
                         ),
                       ),
                     ],
@@ -541,7 +554,6 @@ class _AuthPageState extends State<AuthPage> {
           ),
           const SizedBox(height: 12),
 
-          // is_email_verify==1 才显示验证码输入和发送按钮
           if (guest.isEmailVerify == 1) ...[
             Row(
               children: [
@@ -549,10 +561,7 @@ class _AuthPageState extends State<AuthPage> {
                   child: TextFormField(
                     controller: regEmailCodeCtrl,
                     enabled: !busy,
-                    decoration: const InputDecoration(
-                      labelText: '邮箱验证码',
-                      border: OutlineInputBorder(),
-                    ),
+                    decoration: const InputDecoration(labelText: '邮箱验证码', border: OutlineInputBorder()),
                     validator: (v) => (v ?? '').trim().isEmpty ? '请输入验证码' : null,
                   ),
                 ),
@@ -583,6 +592,7 @@ class _AuthPageState extends State<AuthPage> {
             Text('密码至少 8 位', style: TextStyle(color: Colors.redAccent.withOpacity(0.9))),
           ],
           const SizedBox(height: 12),
+
           TextFormField(
             controller: regPwd2Ctrl,
             enabled: !busy,
@@ -591,14 +601,15 @@ class _AuthPageState extends State<AuthPage> {
             validator: (v) => _vPwd2Match(v, regPwd1Ctrl),
           ),
           const SizedBox(height: 12),
+
           TextFormField(
             controller: regInviteCtrl,
             enabled: !busy,
             decoration: const InputDecoration(labelText: '邀请码（可选）', border: OutlineInputBorder()),
           ),
           const SizedBox(height: 12),
+
           SizedBox(
-            width: double.infinity,
             height: 48,
             child: ElevatedButton(
               onPressed: busy ? null : _doRegister,
@@ -621,14 +632,13 @@ class _AuthPageState extends State<AuthPage> {
   }
 
   Widget _buildReset() {
-    // 没开邮箱验证就直接提示（因为你说 is_email_verify=0 不显示验证码按钮）
     if (guest.isEmailVerify != 1) {
       return Column(
         key: const ValueKey('reset_disabled'),
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Text(
-            '当前站点未开启邮箱验证码（is_email_verify=0），无法通过邮箱验证码重置密码。',
+            '当前站点未开启邮箱验证，请联系管理员重置密码。',
             style: TextStyle(color: Colors.white.withOpacity(0.75)),
           ),
           const SizedBox(height: 12),
@@ -658,6 +668,7 @@ class _AuthPageState extends State<AuthPage> {
             enabled: !busy,
           ),
           const SizedBox(height: 12),
+
           Row(
             children: [
               Expanded(
@@ -680,6 +691,7 @@ class _AuthPageState extends State<AuthPage> {
             ],
           ),
           const SizedBox(height: 12),
+
           TextFormField(
             controller: resetPwd1Ctrl,
             enabled: !busy,
@@ -693,6 +705,7 @@ class _AuthPageState extends State<AuthPage> {
             Text('密码至少 8 位', style: TextStyle(color: Colors.redAccent.withOpacity(0.9))),
           ],
           const SizedBox(height: 12),
+
           TextFormField(
             controller: resetPwd2Ctrl,
             enabled: !busy,
@@ -701,8 +714,8 @@ class _AuthPageState extends State<AuthPage> {
             validator: (v) => _vPwd2Match(v, resetPwd1Ctrl),
           ),
           const SizedBox(height: 12),
+
           SizedBox(
-            width: double.infinity,
             height: 48,
             child: ElevatedButton(
               onPressed: busy ? null : _doReset,
