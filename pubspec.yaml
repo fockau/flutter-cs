@@ -1,5 +1,5 @@
 name: xboard_client
-description: XBoard Client (auth first)
+description: XBoard Client
 publish_to: "none"
 version: 1.0.0+1
 
