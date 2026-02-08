@@ -5,7 +5,7 @@ import 'domain_racer.dart';
 import 'session_service.dart';
 
 class GuestConfigParsed {
-  final int isEmailVerify;
+  final int isEmailVerify; // 0/1
   final List<String> emailWhitelistSuffix;
   final String? appDescription;
 
@@ -32,7 +32,12 @@ class GuestConfigParsed {
 
     List<String> suffix = [];
     if (raw is List) {
-      suffix = raw.map((e) => e.toString().trim()).where((e) => e.isNotEmpty).toSet().toList()..sort();
+      suffix = raw
+          .map((e) => e.toString().trim())
+          .where((e) => e.isNotEmpty)
+          .toSet()
+          .toList()
+        ..sort();
     }
 
     return GuestConfigParsed(
@@ -53,7 +58,6 @@ class XBoardApi {
   static final XBoardApi I = XBoardApi._();
   XBoardApi._();
 
-  // 订阅请求保守超时（你要更快可调小）
   static const subscribeTimeout = Duration(seconds: 8);
   static const normalTimeout = Duration(seconds: 10);
 
@@ -63,7 +67,6 @@ class XBoardApi {
   late String websiteUrl;
 
   bool _ready = false;
-
   bool get ready => _ready;
 
   Uri _api(String pathUnderApiV1) {
@@ -85,6 +88,29 @@ class XBoardApi {
     return h;
   }
 
+  Future<Map<String, dynamic>> _postJson(
+    String path, {
+    required Map<String, dynamic> body,
+    bool auth = false,
+  }) async {
+    if (!_ready) await initResolveDomain();
+    final resp = await http
+        .post(
+          _api(path),
+          headers: _headers(json: true, auth: auth),
+          body: jsonEncode(body),
+        )
+        .timeout(normalTimeout);
+
+    final dynamic j = jsonDecode(resp.body);
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      final msg = (j is Map && j['message'] != null) ? j['message'].toString() : 'HTTP ${resp.statusCode}';
+      throw Exception(msg);
+    }
+    if (j is! Map<String, dynamic>) throw Exception('response not object');
+    return j;
+  }
+
   Future<void> initResolveDomain() async {
     final r = await DomainRacer.I.resolve();
     _baseUrl = r.baseUrl;
@@ -94,40 +120,87 @@ class XBoardApi {
     _ready = true;
   }
 
+  /// 公共配置（不需要认证）
   Future<GuestConfigParsed> fetchGuestConfig() async {
     if (!_ready) await initResolveDomain();
     final resp = await http.get(_api('/guest/comm/config'), headers: _headers()).timeout(normalTimeout);
 
-    final j = jsonDecode(resp.body);
+    final dynamic j = jsonDecode(resp.body);
     if (resp.statusCode != 200 || j is! Map<String, dynamic>) {
       throw Exception('guest config http ${resp.statusCode}');
     }
     return GuestConfigParsed.fromResponse(j);
   }
 
+  /// 登录
   Future<Map<String, dynamic>> login({required String email, required String password}) async {
-    if (!_ready) await initResolveDomain();
-    final resp = await http
-        .post(
-          _api('/passport/auth/login'),
-          headers: _headers(json: true),
-          body: jsonEncode({'email': email, 'password': password}),
-        )
-        .timeout(normalTimeout);
-
-    final j = jsonDecode(resp.body);
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      throw Exception((j is Map && j['message'] != null) ? j['message'] : 'HTTP ${resp.statusCode}');
-    }
-    if (j is! Map<String, dynamic>) throw Exception('login response not object');
-    return j;
+    return _postJson(
+      '/passport/auth/login',
+      body: {'email': email, 'password': password},
+      auth: false,
+    );
   }
 
+  /// 注册（inviteCode 可选）
+  Future<Map<String, dynamic>> register({
+    required String email,
+    required String password,
+    String? inviteCode,
+    String? emailCode,
+  }) async {
+    final body = <String, dynamic>{
+      'email': email,
+      'password': password,
+    };
+    if (inviteCode != null && inviteCode.trim().isNotEmpty) {
+      body['invite_code'] = inviteCode.trim();
+    }
+    if (emailCode != null && emailCode.trim().isNotEmpty) {
+      body['email_code'] = emailCode.trim();
+    }
+    return _postJson('/passport/auth/register', body: body, auth: false);
+  }
+
+  /// 发送邮箱验证码：scene 自动传入（register / reset_password）
+  Future<Map<String, dynamic>> sendEmailCode({
+    required String email,
+    required String scene,
+  }) async {
+    return _postJson(
+      '/passport/auth/sendEmailCode',
+      body: {'email': email, 'scene': scene},
+      auth: false,
+    );
+  }
+
+  /// 重置密码
+  Future<Map<String, dynamic>> resetPassword({
+    required String email,
+    required String password,
+    required String emailCode,
+  }) async {
+    return _postJson(
+      '/passport/auth/resetPassword',
+      body: {'email': email, 'password': password, 'email_code': emailCode},
+      auth: false,
+    );
+  }
+
+  /// 登出（可选调用，前端仍需清 token）
+  Future<void> logout() async {
+    try {
+      await _postJson('/passport/auth/logout', body: {}, auth: true);
+    } catch (_) {
+      // 后端不通/返回错误也不影响前端清 session
+    }
+  }
+
+  /// 获取订阅（需要认证）
   Future<Map<String, dynamic>> getSubscribe() async {
     if (!_ready) await initResolveDomain();
     final resp = await http.get(_api('/user/getSubscribe'), headers: _headers(auth: true)).timeout(subscribeTimeout);
 
-    final j = jsonDecode(resp.body);
+    final dynamic j = jsonDecode(resp.body);
     if (resp.statusCode < 200 || resp.statusCode >= 300) {
       final msg = (j is Map && j['message'] != null) ? j['message'].toString() : 'HTTP ${resp.statusCode}';
       throw Exception(msg);
