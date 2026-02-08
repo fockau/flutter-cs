@@ -1,9 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
-
 import 'app_storage.dart';
 import 'auth_page.dart';
-import 'session_service.dart';
 import 'xboard_api.dart';
 
 class HomePage extends StatefulWidget {
@@ -15,107 +13,118 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  bool loading = false;
+  bool busy = false;
   String? err;
-  Map<String, dynamic>? data;
+  Map<String, dynamic>? sub;
+  DateTime? lastUpdate;
 
   @override
   void initState() {
     super.initState();
-    data = widget.initialSubscribeCache ?? AppStorage.I.getJson(AppStorage.kSubscribeCache);
-    // 后台刷新最新（不阻塞首屏）
-    WidgetsBinding.instance.addPostFrameCallback((_) => _refresh());
+    sub = widget.initialSubscribeCache;
+    if (sub != null) lastUpdate = DateTime.now();
+    _refresh();
   }
 
   Future<void> _refresh() async {
     setState(() {
-      loading = true;
+      busy = true;
       err = null;
     });
-
     try {
-      final sub = await XBoardApi.I.getSubscribe();
-      final d = (sub['data'] is Map) ? Map<String, dynamic>.from(sub['data']) : <String, dynamic>{};
-      await AppStorage.I.setJson(AppStorage.kSubscribeCache, d);
-      setState(() => data = d);
+      final j = await XBoardApi.I.getSubscribe();
+      final data = (j['data'] is Map) ? Map<String, dynamic>.from(j['data']) : <String, dynamic>{};
+      await AppStorage.I.setJson(AppStorage.kSubscribeCache, data);
+      setState(() {
+        sub = data;
+        lastUpdate = DateTime.now();
+      });
     } catch (e) {
-      // 常见：403/过期
-      final es = e.toString();
-      if (es.contains('403') || es.contains('未登录') || es.contains('过期')) {
-        await SessionService.I.clearSessionOnly();
-        if (!mounted) return;
-        Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const AuthPage(force: true)));
-        return;
-      }
       setState(() => err = e.toString());
     } finally {
-      setState(() => loading = false);
+      setState(() => busy = false);
     }
   }
 
   Future<void> _logout() async {
-    await SessionService.I.logoutClearAll();
+    setState(() {
+      busy = true;
+      err = null;
+    });
+    try {
+      await XBoardApi.I.logout();
+    } catch (_) {}
+    await XBoardApi.I.clearSessionOnly();
+
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const AuthPage(force: true)));
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => const AuthPage(force: true)),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final subUrl = (data?['subscribe_url'] ?? '').toString();
+    final subscribeUrl = sub?['subscribe_url']?.toString() ?? '-';
+    final pretty = const JsonEncoder.withIndent('  ').convert(sub ?? {});
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0B0F17),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF0B0F17),
-        title: const Text('订阅'),
+        title: const Text('订阅信息'),
         actions: [
-          IconButton(onPressed: loading ? null : _refresh, icon: const Icon(Icons.refresh)),
-          IconButton(onPressed: loading ? null : _logout, icon: const Icon(Icons.logout)),
+          IconButton(onPressed: busy ? null : _refresh, icon: const Icon(Icons.refresh)),
+          IconButton(onPressed: busy ? null : _logout, icon: const Icon(Icons.logout)),
         ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(14),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Card(
-              color: const Color(0xFF121827),
-              child: Padding(
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('订阅链接', style: TextStyle(fontWeight: FontWeight.w800)),
-                    const SizedBox(height: 10),
-                    SelectableText(subUrl.isEmpty ? '暂无（正在刷新或未订阅）' : subUrl),
-                    if (loading) ...[
-                      const SizedBox(height: 10),
-                      const LinearProgressIndicator(minHeight: 3),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: Card(
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            children: [
+              Card(
                 color: const Color(0xFF121827),
                 child: Padding(
                   padding: const EdgeInsets.all(14),
-                  child: SingleChildScrollView(
-                    child: SelectableText(
-                      const JsonEncoder.withIndent('  ').convert(data ?? {}),
-                      style: const TextStyle(fontFamily: 'monospace'),
-                    ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Text('订阅链接', style: TextStyle(color: Colors.white.withOpacity(0.85), fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 8),
+                      SelectableText(subscribeUrl, style: const TextStyle(fontSize: 13.5)),
+                      const SizedBox(height: 10),
+                      Text(
+                        '最后更新：${lastUpdate?.toLocal().toString().split('.').first ?? '-'}',
+                        style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 12.5),
+                      ),
+                      const SizedBox(height: 10),
+                      SizedBox(
+                        height: 44,
+                        child: ElevatedButton(
+                          onPressed: busy ? null : _refresh,
+                          child: busy
+                              ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Text('获取最新订阅'),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-            ),
-            if (err != null) ...[
-              const SizedBox(height: 10),
-              Text(err!, style: const TextStyle(color: Colors.redAccent)),
+              if (err != null) ...[
+                const SizedBox(height: 12),
+                Text(err!, style: const TextStyle(color: Colors.redAccent)),
+              ],
+              const SizedBox(height: 12),
+              Expanded(
+                child: Card(
+                  color: const Color(0xFF121827),
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: SingleChildScrollView(child: SelectableText(pretty, style: const TextStyle(fontSize: 12.5))),
+                  ),
+                ),
+              ),
             ],
-          ],
+          ),
         ),
       ),
     );
