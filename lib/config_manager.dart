@@ -1,69 +1,81 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
-class RemoteConfigData {
-  final String apiPrefix; // 例如 /api/v1
-  final List<String> domains; // 例如 ["https://a.com","https://b.com"]
-  final String supportUrl;
-  final String websiteUrl;
+import 'app_storage.dart';
 
-  const RemoteConfigData({
+class RemoteConfig {
+  final String apiPrefix; // 例如 /api/v1
+  final List<String> domains; // https://a.com
+  final String supportUrl; // 客服
+  final String websiteUrl; // 官网
+
+  const RemoteConfig({
     required this.apiPrefix,
     required this.domains,
     required this.supportUrl,
     required this.websiteUrl,
   });
 
-  Map<String, dynamic> toJson() => {
-        'api_prefix': apiPrefix,
-        'domains': domains,
-        'support_url': supportUrl,
-        'website_url': websiteUrl,
-      };
+  static RemoteConfig fromJson(Map<String, dynamic> j) {
+    final apiPrefix = (j['apiPrefix'] ?? '/api/v1').toString();
+    final domainsRaw = j['domains'];
+    final domains = (domainsRaw is List ? domainsRaw : <dynamic>[])
+        .map((e) => e.toString().trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
 
-  static RemoteConfigData fromJson(Map<String, dynamic> j) {
-    final apiPrefix = (j['api_prefix'] ?? '/api/v1').toString().trim();
-    final rawDomains = j['domains'];
-    final domains = (rawDomains is List)
-        ? rawDomains.map((e) => e.toString().trim()).where((e) => e.startsWith('http')).toSet().toList()
-        : <String>[];
+    final supportUrl = (j['supportUrl'] ?? '').toString();
+    final websiteUrl = (j['websiteUrl'] ?? '').toString();
 
-    return RemoteConfigData(
-      apiPrefix: apiPrefix.isEmpty ? '/api/v1' : apiPrefix,
-      domains: domains,
-      supportUrl: (j['support_url'] ?? '').toString().trim(),
-      websiteUrl: (j['website_url'] ?? '').toString().trim(),
-    );
+    if (domains.isEmpty) {
+      throw Exception('remote config: domains 为空');
+    }
+    return RemoteConfig(apiPrefix: apiPrefix, domains: domains, supportUrl: supportUrl, websiteUrl: websiteUrl);
   }
+
+  Map<String, dynamic> toJson() => {
+        'apiPrefix': apiPrefix,
+        'domains': domains,
+        'supportUrl': supportUrl,
+        'websiteUrl': websiteUrl,
+      };
 }
 
 class ConfigManager {
   static final ConfigManager I = ConfigManager._();
   ConfigManager._();
 
-  // ======== 只改这里：你的远程 config.json 地址 ========
+  // TODO：改成你自己的地址
   static const String remoteConfigUrl = 'https://raw.githubusercontent.com/fockau/flutter-cs/refs/heads/main/config.json';
-  // =====================================================
 
-  Future<RemoteConfigData> fetchRemoteConfig({Duration timeout = const Duration(seconds: 6)}) async {
-    final resp = await http.get(Uri.parse(remoteConfigUrl)).timeout(timeout);
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      throw Exception('remote config http ${resp.statusCode}');
+  // 远程是否为 base64（如果你服务端返回的是 base64 字符串就设 true）
+  static const bool remoteIsBase64 = false;
+
+  static const Duration cacheTtl = Duration(hours: 6);
+
+  Future<RemoteConfig> loadRemoteConfig({bool forceRefresh = false}) async {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final cachedAt = AppStorage.I.getInt(AppStorage.kRemoteConfigCachedAt);
+
+    if (!forceRefresh && cachedAt > 0 && (now - cachedAt) < cacheTtl.inMilliseconds) {
+      final cached = AppStorage.I.getJson(AppStorage.kRemoteConfigCache);
+      if (cached != null) return RemoteConfig.fromJson(cached);
     }
 
-    final body = resp.body.trim();
+    final resp = await http.get(Uri.parse(remoteConfigUrl)).timeout(const Duration(seconds: 8));
+    if (resp.statusCode != 200) throw Exception('remote config http ${resp.statusCode}');
 
-    // 明文 JSON
-    if (body.startsWith('{') && body.endsWith('}')) {
-      final j = jsonDecode(body);
-      if (j is Map<String, dynamic>) return RemoteConfigData.fromJson(j);
-      throw Exception('remote config not object');
+    Map<String, dynamic> j;
+    if (remoteIsBase64) {
+      final decoded = utf8.decode(base64Decode(resp.body.trim()));
+      j = jsonDecode(decoded) as Map<String, dynamic>;
+    } else {
+      j = jsonDecode(resp.body) as Map<String, dynamic>;
     }
 
-    // base64(JSON)
-    final decoded = utf8.decode(base64Decode(body));
-    final j = jsonDecode(decoded);
-    if (j is Map<String, dynamic>) return RemoteConfigData.fromJson(j);
-    throw Exception('remote config base64 not object');
+    final rc = RemoteConfig.fromJson(j);
+    await AppStorage.I.setJson(AppStorage.kRemoteConfigCache, rc.toJson());
+    await AppStorage.I.setInt(AppStorage.kRemoteConfigCachedAt, now);
+    return rc;
   }
 }
